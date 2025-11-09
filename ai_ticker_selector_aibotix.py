@@ -17,18 +17,16 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetStatus
 
 # --- Load Environment Variables ---
-load_dotenv('/Users/aibotix/Desktop/AIBOTIX/ai_selector.env')
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("BASE_URL", "https://paper-api.alpaca.markets")
-SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL_SECONDS", "3600"))
+load_dotenv()
 
-# --- Initialize Clients ---
-data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
 
 # --- Logger Setup ---
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+def create_clients(api_key, api_secret, paper=True):
+    data_client = StockHistoricalDataClient(api_key, api_secret)
+    trading_client = TradingClient(api_key, api_secret, paper=paper)
+    return data_client, trading_client
 
 RSI_PERIOD = 14
 
@@ -46,7 +44,7 @@ def compute_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-async def fetch_indicators(symbol):
+async def fetch_indicators(symbol, data_client):
     try:
         bars_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=100)
         bars = data_client.get_stock_bars(bars_req).df
@@ -69,7 +67,7 @@ async def fetch_indicators(symbol):
         logging.warning(f"Fetch failed for {symbol}: {e}")
         raise  # Temporarily raise for debugging
 
-async def stage_a_screen_and_collect(limit=5):
+async def stage_a_screen_and_collect(data_client, trading_client, limit=5):
     failed_symbols = []  # Initialize the failed_symbols list
     try:
         assets = trading_client.get_all_assets()
@@ -110,7 +108,7 @@ async def stage_a_screen_and_collect(limit=5):
     random.shuffle(volume_filtered)
 
     indicator_results = []
-    tasks = [fetch_indicators(sym) for sym in volume_filtered[:100]]
+    tasks = [fetch_indicators(sym, data_client) for sym in volume_filtered[:100]]
     results = await asyncio.gather(*tasks)
 
     for symbol, df in zip(volume_filtered[:100], results):
@@ -223,10 +221,14 @@ def record_trade_feedback(symbol, profit, filename="ai_ticker_feedback.csv"):
     except Exception as e:
         logging.warning(f"Failed to record feedback: {e}")
 
-if __name__ == "__main__":
-    results = asyncio.run(stage_a_screen_and_collect())
-    log_selected_tickers_for_learning(results)
-    top = score_tickers(results)
+
+# New async function to be called externally (e.g., from main.py)
+async def get_top_tickers_from_api_keys(api_key, api_secret, top_n=5, paper=True):
+    data_client, trading_client = create_clients(api_key, api_secret, paper=paper)
+    indicator_results = await stage_a_screen_and_collect(data_client, trading_client)
+    log_selected_tickers_for_learning(indicator_results)
+    top_tickers = score_tickers(indicator_results, top_n=top_n)
+    return top_tickers
 
 def get_top_tickers(indicator_log_csv='ai_ticker_learning_log.csv', top_n=5):
     try:

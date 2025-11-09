@@ -3,8 +3,11 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import MACD
 import websockets
 import json
+import sys
+
+
+# Use the new alpaca-py library (v3) imports
 from alpaca.trading.client import TradingClient
-# Alpaca v3 trading enums and order request
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.common.exceptions import APIError
@@ -14,7 +17,6 @@ import datetime
 import pytz
 import numpy as np
 import os
-import sys
 from dotenv import load_dotenv
 import logging
 import asyncio
@@ -31,28 +33,13 @@ except Exception:
             pass
     caffeine = _CaffeineShim()
 
-# Alpaca data API imports for historical and latest trade data (v3)
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
-import sys
-# CONFIGURATION
 BASE_URL = 'https://paper-api.alpaca.markets'  # use live URL for real trading
 # TICKERS will be dynamically set using AI ticker selector or command line
-tickers = sys.argv[1:]
-if not tickers:
-    print("No tickers provided by AI Ticker Selector. Exiting.")
-    exit(0)
+tickers = sys.argv[3:]  # API key and secret are sys.argv[1] and sys.argv[2]
 TICKERS = []
 RSI_PERIOD = 14
 MAX_DRAWDOWN = 0.10  # 10%
@@ -98,10 +85,9 @@ def can_attempt_trade(ticker: str) -> bool:
     recent_trade_attempts[key] = count + 1
     return True
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-api = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=True)
+api = None
 ny_tz = pytz.timezone('America/New_York')
 
 trade_log = []
@@ -128,8 +114,7 @@ recently_traded = {}
 # Track last buy/sell timestamps for each ticker
 trade_history = {}  # Tracks last buy/sell timestamps for each ticker
 
-# Alpaca data client for historical and latest trade data
-data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+data_client = None
 
 # --- Step 3 helpers: daily reset & halting ---
 
@@ -904,41 +889,50 @@ def plot_backtest_results(historical_data, trade_log, ticker):
     plt.legend()
     plt.show()
 
-# Entry point for the asynchronous bot
-if __name__ == "__main__":
-    # Start heartbeat monitor in a separate thread
+
+# --- API endpoint for starting the bot with individual user API keys ---
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+def run_bot_with_keys(api_key: str, api_secret: str, paper: bool):
+    """
+    Start the trading bot with the given API credentials and paper/live mode.
+    This function initializes the TradingClient and other dependencies using these keys,
+    then starts the trading loop (typically in a background thread or async task).
+    """
+    import threading
+    import asyncio
+    from alpaca.trading.client import TradingClient
+    from alpaca.data.historical import StockHistoricalDataClient
+    global api, data_client
+    # Ensure credentials are provided
+    if not api_key or not api_secret or not api_key.strip() or not api_secret.strip():
+        raise ValueError("❌ Alpaca API keys are required to start trading.")
+    api = TradingClient(api_key, api_secret, paper=paper)
+    data_client = StockHistoricalDataClient(api_key, api_secret)
+    # Start heartbeat and trading loop in background
     heartbeat_thread = threading.Thread(target=heartbeat_monitor, daemon=True)
     heartbeat_thread.start()
+    def bot_main():
+        asyncio.run(trade_loop_async())
+    bot_thread = threading.Thread(target=bot_main, daemon=True)
+    bot_thread.start()
 
-    start_websocket_stream()
-    asyncio.run(trade_loop_async())
+app = FastAPI()
 
-    # Load historical data (replace with actual data loading logic)
-    try:
-        req_bt = StockBarsRequest(
-            symbol="AAPL",
-            timeframe=TimeFrame.Day,
-            start=None,
-            end=None,
-            limit=100
-        )
-        historical_data = data_client.get_stock_bars(req_bt).df
-    except Exception as e:
-        logging.error(f"Error fetching historical data: {e}")
-        historical_data = None
-        # Skip backtest if error
-        import sys
-        sys.exit(0)
+class BotStartRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    paper: bool
 
-    if historical_data is None or historical_data.empty:
-        logging.warning("Historical data is empty. Backtest aborted.")
-        import sys
-        sys.exit(0)
-
-    if hasattr(historical_data, 'index') and isinstance(historical_data.index, pd.MultiIndex):
-        historical_data = historical_data.xs("AAPL")
-    historical_data = historical_data.sort_index()
-
-    # Run backtest
-    final_equity = backtest("AAPL", historical_data)
-    print(f"Final equity after backtest: ${final_equity:.2f}")
+@app.post("/start-bot")
+async def start_bot_endpoint(request: BotStartRequest):
+    # Validate credentials before starting
+    if not request.api_key or not request.api_secret or not request.api_key.strip() or not request.api_secret.strip():
+        return {"status": "error", "detail": "Alpaca API key and secret are required."}
+    run_bot_with_keys(
+        api_key=request.api_key,
+        api_secret=request.api_secret,
+        paper=request.paper
+    )
+    return {"status": "Bot started"}

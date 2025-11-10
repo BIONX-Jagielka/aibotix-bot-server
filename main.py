@@ -116,3 +116,7 @@ def stop_bot():
     bot_process.terminate()
     bot_process = None
     return {"message": "Bot stopped."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)

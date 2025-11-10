@@ -11,7 +11,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 fernet = Fernet(ENCRYPTION_KEY.encode())

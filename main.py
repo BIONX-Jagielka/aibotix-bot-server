@@ -9,9 +9,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+print("🚀 Starting AIBOTIX bot server...")
+
+print("SUPABASE_URL:", os.getenv("SUPABASE_URL"))
+print("SUPABASE_KEY:", os.getenv("SUPABASE_KEY"))
+print("ENCRYPTION_KEY:", os.getenv("ENCRYPTION_KEY"))
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY or not ENCRYPTION_KEY:
+    raise EnvironmentError("❌ Missing one or more required environment variables.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 fernet = Fernet(ENCRYPTION_KEY.encode())

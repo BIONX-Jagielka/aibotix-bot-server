@@ -25,6 +25,7 @@ try:
 
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     fernet = Fernet(ENCRYPTION_KEY.encode())
+    print("✅ Supabase client and Fernet key initialized successfully.")
 
 except Exception as e:
     import traceback

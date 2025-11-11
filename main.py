@@ -36,7 +36,7 @@ except Exception as e:
 
 app = FastAPI()
 
-bot_process = None
+bot_processes = {"paper": None, "live": None}
 
 def get_alpaca_keys(user_id: str, mode: str = "paper"):
     try:
@@ -92,13 +92,13 @@ async def get_status(request: Request):
 
 @app.post("/api/start")
 async def start_bot(request: Request):
-    global bot_process
-    if bot_process is not None:
-        return {"message": "Bot already running."}
-
+    global bot_processes
     body = await request.json()
     user_id = body.get("user_id")
     mode = body.get("mode", "paper")
+
+    if bot_processes[mode] is not None:
+        return {"message": f"{mode.capitalize()} bot already running."}
 
     if not user_id:
         return {"error": "Missing user_id in request."}
@@ -118,7 +118,7 @@ async def start_bot(request: Request):
     env["APCA_API_KEY_ID"] = api_key_id
     env["APCA_API_SECRET_KEY"] = api_secret
 
-    bot_process = subprocess.Popen(
+    bot_processes[mode] = subprocess.Popen(
         ["python", "aibotix_trading_bot.py"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -137,21 +137,28 @@ async def start_bot(request: Request):
     return {"message": "Bot started for user."}
 
 @app.post("/api/stop")
-def stop_bot():
-    global bot_process
-    if bot_process is None:
-        return {"message": "Bot not running."}
-    bot_process.terminate()
-    bot_process = None
-    try:
-        supabase.table("bot_status").upsert({
-            "user_id": "system",
-            "running": False,
-            "updated_at": datetime.utcnow().isoformat()
-        }).execute()
-    except Exception as e:
-        print("Error updating bot_status table on stop:", e)
-    return {"message": "Bot stopped."}
+async def stop_bot(request: Request):
+    global bot_processes
+    body = await request.json()
+    user_id = body.get("user_id")
+    mode = body.get("mode", "paper")
+
+    process = bot_processes.get(mode)
+    if process:
+        process.terminate()
+        bot_processes[mode] = None
+        try:
+            supabase.table("bot_status").upsert({
+                "user_id": user_id,
+                "mode": mode,
+                "running": False,
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+        except Exception as e:
+            print("Error updating bot_status table on stop:", e)
+        return {"message": f"{mode.capitalize()} bot stopped successfully."}
+    else:
+        return {"message": f"No {mode} bot is currently running."}
 
 if __name__ == "__main__":
     import uvicorn

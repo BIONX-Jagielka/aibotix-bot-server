@@ -6,6 +6,7 @@ from supabase import create_client, Client
 from cryptography.fernet import Fernet
 import os
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()
 
@@ -69,8 +70,25 @@ def read_root():
     return {"message": "AIBOTIX Bot Server is up and running!"}
 
 @app.get("/api/status")
-def get_status():
-    return {"running": bot_process is not None}
+async def get_status(request: Request):
+    try:
+        body = await request.json()
+        user_id = body.get("user_id")
+        if not user_id:
+            return {"error": "Missing user_id in request."}
+        response = supabase.table("bot_status").select("*").eq("user_id", user_id).execute()
+        if not response.data:
+            return {"running": False, "mode": None, "start_time": None}
+        status = response.data[0]
+        return {
+            "running": status.get("running", False),
+            "mode": status.get("mode"),
+            "start_time": status.get("start_time"),
+            "updated_at": status.get("updated_at")
+        }
+    except Exception as e:
+        print("Error fetching bot status:", e)
+        return {"error": str(e)}
 
 @app.post("/api/start")
 async def start_bot(request: Request):
@@ -106,6 +124,16 @@ async def start_bot(request: Request):
         stderr=subprocess.PIPE,
         env=env
     )
+    try:
+        supabase.table("bot_status").upsert({
+            "user_id": user_id,
+            "mode": mode,
+            "running": True,
+            "start_time": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        print("Error updating bot_status table on start:", e)
     return {"message": "Bot started for user."}
 
 @app.post("/api/stop")
@@ -115,6 +143,14 @@ def stop_bot():
         return {"message": "Bot not running."}
     bot_process.terminate()
     bot_process = None
+    try:
+        supabase.table("bot_status").upsert({
+            "user_id": "system",
+            "running": False,
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        print("Error updating bot_status table on stop:", e)
     return {"message": "Bot stopped."}
 
 if __name__ == "__main__":

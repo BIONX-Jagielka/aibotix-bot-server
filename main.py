@@ -70,25 +70,12 @@ def read_root():
     return {"message": "AIBOTIX Bot Server is up and running!"}
 
 @app.get("/api/status")
-async def get_status(request: Request):
-    try:
-        body = await request.json()
-        user_id = body.get("user_id")
-        if not user_id:
-            return {"error": "Missing user_id in request."}
-        response = supabase.table("bot_status").select("*").eq("user_id", user_id).execute()
-        if not response.data:
-            return {"running": False, "mode": None, "start_time": None}
-        status = response.data[0]
-        return {
-            "running": status.get("running", False),
-            "mode": status.get("mode"),
-            "start_time": status.get("start_time"),
-            "updated_at": status.get("updated_at")
-        }
-    except Exception as e:
-        print("Error fetching bot status:", e)
-        return {"error": str(e)}
+async def get_status():
+    return {
+        "paper_running": bot_processes["paper"] is not None,
+        "live_running": bot_processes["live"] is not None,
+        "updated_at": datetime.utcnow().isoformat()
+    }
 
 @app.post("/api/start")
 async def start_bot(request: Request):

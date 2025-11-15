@@ -13,9 +13,7 @@ load_dotenv()
 try:
     print("🚀 Starting AIBOTIX bot server...")
 
-    print("SUPABASE_URL:", os.getenv("SUPABASE_URL"))
-    print("SUPABASE_KEY:", os.getenv("SUPABASE_KEY"))
-    print("ENCRYPTION_KEY:", os.getenv("ENCRYPTION_KEY"))
+    print("Initializing secure environment variables... ✔️")
 
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -96,10 +94,10 @@ async def start_bot(request: Request):
 
     api_key_id, api_secret = creds
     selected_tickers = ai_ticker_selector_aibotix.get_top_tickers_from_api_keys(api_key_id, api_secret, mode)
-    print("Selected tickers:", selected_tickers)
+    print(f"[{mode.upper()}] AI selected tickers: {selected_tickers}")
 
     if not selected_tickers:
-        print("No tickers selected. Bot will wait for market signals.")
+        print(f"[{mode.upper()}] No tickers selected — waiting for market signals.")
 
     env = os.environ.copy()
     env["APCA_API_KEY_ID"] = api_key_id
@@ -120,7 +118,7 @@ async def start_bot(request: Request):
             "updated_at": datetime.utcnow().isoformat()
         }).execute()
     except Exception as e:
-        print("Error updating bot_status table on start:", e)
+        print(f"[{mode.upper()}] Warning: could not update bot status on start.")
     return {"message": "Bot started for user."}
 
 @app.post("/api/stop")
@@ -134,6 +132,7 @@ async def stop_bot(request: Request):
     if process:
         process.terminate()
         bot_processes[mode] = None
+        print(f"[{mode.upper()}] Bot stopped successfully.")
         try:
             supabase.table("bot_status").upsert({
                 "user_id": user_id,
@@ -142,7 +141,7 @@ async def stop_bot(request: Request):
                 "updated_at": datetime.utcnow().isoformat()
             }).execute()
         except Exception as e:
-            print("Error updating bot_status table on stop:", e)
+            print(f"[{mode.upper()}] Warning: could not update bot status on stop.")
         return {"message": f"{mode.capitalize()} bot stopped successfully."}
     else:
         return {"message": f"No {mode} bot is currently running."}

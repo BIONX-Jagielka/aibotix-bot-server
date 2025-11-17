@@ -22,7 +22,7 @@ import signal
 import threading
 import matplotlib.pyplot as plt
 import random
-from ai_ticker_selector_aibotix import get_top_tickers
+from bot.ai_ticker_selector_aibotix import get_top_tickers
 try:
     import caffeine
 except Exception:

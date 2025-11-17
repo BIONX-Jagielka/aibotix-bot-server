@@ -3,11 +3,8 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import MACD
 import websockets
 import json
-import sys
-
-
-# Use the new alpaca-py library (v3) imports
 from alpaca.trading.client import TradingClient
+# Alpaca v3 trading enums and order request
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.common.exceptions import APIError
@@ -17,6 +14,7 @@ import datetime
 import pytz
 import numpy as np
 import os
+import sys
 from dotenv import load_dotenv
 import logging
 import asyncio
@@ -33,13 +31,24 @@ except Exception:
             pass
     caffeine = _CaffeineShim()
 
+# Alpaca data API imports for historical and latest trade data (v3)
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = None
+API_SECRET = None
+
+# CONFIGURATION
 BASE_URL = 'https://paper-api.alpaca.markets'  # use live URL for real trading
-# TICKERS will be dynamically set using AI ticker selector or command line
-tickers = sys.argv[3:]  # API key and secret are sys.argv[1] and sys.argv[2]
+# TICKERS will be dynamically set using AI ticker selector
+# TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
 TICKERS = []
 RSI_PERIOD = 14
 MAX_DRAWDOWN = 0.10  # 10%
@@ -85,9 +94,30 @@ def can_attempt_trade(ticker: str) -> bool:
     recent_trade_attempts[key] = count + 1
     return True
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-api = None
+
+# === Step 2: Dynamic per-user API initialization (Supabase-ready) ===
+def init_trading_client(api_key: str, api_secret: str, paper: bool = True):
+    """
+    Initialise a TradingClient and data client instance for a specific user.
+    Called by the bot start route with user-specific API keys from Supabase,
+    or from __main__ when running this module directly.
+    """
+    global api, data_client, API_KEY, API_SECRET
+    API_KEY = api_key
+    API_SECRET = api_secret
+
+    api = TradingClient(api_key, api_secret, paper=paper)
+    data_client = StockHistoricalDataClient(api_key, api_secret)
+
+    logging.info(f"Trading client initialised (paper={paper}).")
+    return api
+
+# Global placeholder. Start/stop routes will set this dynamically.
+api: TradingClient | None = None
+
 ny_tz = pytz.timezone('America/New_York')
 
 trade_log = []
@@ -114,7 +144,8 @@ recently_traded = {}
 # Track last buy/sell timestamps for each ticker
 trade_history = {}  # Tracks last buy/sell timestamps for each ticker
 
-data_client = None
+# Alpaca data client for historical and latest trade data
+data_client: StockHistoricalDataClient | None = None
 
 # --- Step 3 helpers: daily reset & halting ---
 
@@ -208,6 +239,10 @@ def _register_trade_outcome(ticker: str, pnl: float):
         logging.warning(f"Exceeded max consecutive losses ({consecutive_losses}). Trading halted until {trading_halted_until}.")
 
 def get_last_trade_price(symbol):
+    global data_client
+    if data_client is None:
+        logging.error("Data client not initialised. Cannot fetch last trade price.")
+        return None
     try:
         req = StockLatestTradeRequest(symbol_or_symbols=symbol)
         trade = data_client.get_stock_latest_trade(req)
@@ -241,6 +276,9 @@ strategy = Strategy(RSI_PERIOD, 14)
 
 # --- Utility Functions ---
 def is_market_open(ticker=None):
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return False
     clock = api.get_clock()
     if not clock.is_open:
         return False
@@ -258,12 +296,21 @@ def is_market_open(ticker=None):
     return True
 
 def get_account():
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return None
     return api.get_account()
 
 def get_equity():
-    return float(get_account().equity)
+    account = get_account()
+    if account is None:
+        return 0.0
+    return float(account.equity)
 
 def get_position(symbol):
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return 0, 0
     try:
         pos = api.get_open_position(symbol)
         return float(pos.qty), float(pos.avg_entry_price)
@@ -279,6 +326,9 @@ class MarketDataError(Exception):
 
 def place_order(symbol, qty, side):
     global realized_pnl
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return False
     try:
         current_price = get_last_trade_price(symbol)
 
@@ -336,6 +386,9 @@ def place_order(symbol, qty, side):
 
 def close_position(symbol):
     global realized_pnl, daily_realized_pnl
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return None
     try:
         # Snapshot before closing
         pos_qty, entry_price = get_position(symbol)
@@ -365,6 +418,9 @@ def close_position(symbol):
 
 def update_pnl():
     global realized_pnl, unrealized_pnl
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return
     unrealized_pnl = 0.0
     try:
         positions = api.get_all_positions()
@@ -421,6 +477,10 @@ def calculate_position_size(symbol, risk_per_trade):
     return round(float(raw_qty), 4)
 
 def fetch_data(symbol):
+    global data_client
+    if data_client is None:
+        logging.error("Data client not initialised. Cannot fetch bar data.")
+        return None
     try:
         # Try minute bars first
         req_min = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=1500)
@@ -567,6 +627,9 @@ def safe_api_call(api_function, *args, **kwargs):
 
 # Market close handling
 def close_all_positions():
+    if api is None:
+        logging.error("Trading client not initialised. Cannot proceed.")
+        return
     try:
         positions = api.get_all_positions()
         for position in positions:
@@ -582,36 +645,31 @@ caffeine.on(display=True)
 # Asynchronous trade loop
 async def trade_loop_async():
     global consecutive_losses, TICKERS
-    # Use tickers from command line if provided, else use AI ticker selector
-    if tickers:
-        TICKERS = tickers
-        logging.info(f"Using tickers from command line or default: {TICKERS}")
-    else:
-        # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
-        while True:
-            if not is_market_open():
-                logging.info("Market is currently closed. Waiting for market to open before fetching tickers...")
-                await asyncio.sleep(300)
-                continue
-            # Wait for AI Ticker Selector to return tickers with retries
-            max_attempts = 5
-            retry_delay = 60  # seconds
+    # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
+    while True:
+        if not is_market_open():
+            logging.info("Market is currently closed. Waiting for market to open before fetching tickers...")
+            await asyncio.sleep(300)
+            continue
+        # Wait for AI Ticker Selector to return tickers with retries
+        max_attempts = 5
+        retry_delay = 60  # seconds
 
-            for attempt in range(1, max_attempts + 1):
-                selected_tickers = get_top_tickers()
-                if selected_tickers:
-                    logging.info(f"Top tickers received: {selected_tickers}")
-                    break
-                else:
-                    logging.info(f"Waiting for AI ticker selector... (attempt {attempt}/{max_attempts})")
-                    await asyncio.sleep(retry_delay)
-            else:
-                logging.error("AI Ticker Selector failed to return tickers after multiple attempts. Exiting trading loop.")
-                continue  # Or use `break` if you want to end the trading loop entirely
-            TICKERS = selected_tickers
-            if TICKERS:
+        for attempt in range(1, max_attempts + 1):
+            selected_tickers = get_top_tickers()
+            if selected_tickers:
+                logging.info(f"Top tickers received: {selected_tickers}")
                 break
-        logging.info(f"Selected tickers for trading: {TICKERS}")
+            else:
+                logging.info(f"Waiting for AI ticker selector... (attempt {attempt}/{max_attempts})")
+                await asyncio.sleep(retry_delay)
+        else:
+            logging.error("AI Ticker Selector failed to return tickers after multiple attempts. Exiting trading loop.")
+            continue  # Or use `break` if you want to end the trading loop entirely
+        TICKERS = selected_tickers
+        if TICKERS:
+            break
+    logging.info(f"Selected tickers for trading: {TICKERS}")
     last_ticker_refresh = datetime.datetime.now(ny_tz)
     while True:
         try:
@@ -623,9 +681,9 @@ async def trade_loop_async():
                 continue
 
             logging.info("Bot is evaluating trade opportunities...")
-            # Refresh tickers every hour, but only if not using command line tickers
+            # Refresh tickers every hour
             now = datetime.datetime.now(ny_tz)
-            if (now - last_ticker_refresh).total_seconds() > 3600 and not tickers:
+            if (now - last_ticker_refresh).total_seconds() > 3600:
                 TICKERS = await asyncio.to_thread(get_top_tickers, 5)
                 logging.info(f"Selected tickers for trading: {TICKERS}")
                 last_ticker_refresh = now
@@ -889,50 +947,54 @@ def plot_backtest_results(historical_data, trade_log, ticker):
     plt.legend()
     plt.show()
 
+# Entry point for the asynchronous bot
+if __name__ == "__main__":
+    # Standalone execution: initialise trading and data clients from environment variables.
+    env_key = os.getenv("ALPACA_API_KEY")
+    env_secret = os.getenv("ALPACA_API_SECRET")
 
-# --- API endpoint for starting the bot with individual user API keys ---
-from fastapi import FastAPI
-from pydantic import BaseModel
+    if not env_key or not env_secret:
+        logging.error("Environment variables ALPACA_API_KEY / ALPACA_API_SECRET are not set. "
+                      "Cannot run standalone trading bot.")
+        sys.exit(1)
 
-def run_bot_with_keys(api_key: str, api_secret: str, paper: bool):
-    """
-    Start the trading bot with the given API credentials and paper/live mode.
-    This function initializes the TradingClient and other dependencies using these keys,
-    then starts the trading loop (typically in a background thread or async task).
-    """
-    import threading
-    import asyncio
-    from alpaca.trading.client import TradingClient
-    from alpaca.data.historical import StockHistoricalDataClient
-    global api, data_client
-    # Ensure credentials are provided
-    if not api_key or not api_secret or not api_key.strip() or not api_secret.strip():
-        raise ValueError("❌ Alpaca API keys are required to start trading.")
-    api = TradingClient(api_key, api_secret, paper=paper)
-    data_client = StockHistoricalDataClient(api_key, api_secret)
-    # Start heartbeat and trading loop in background
+    init_trading_client(env_key, env_secret, paper=True)
+
+    # Start heartbeat monitor in a separate thread
     heartbeat_thread = threading.Thread(target=heartbeat_monitor, daemon=True)
     heartbeat_thread.start()
-    def bot_main():
-        asyncio.run(trade_loop_async())
-    bot_thread = threading.Thread(target=bot_main, daemon=True)
-    bot_thread.start()
 
-app = FastAPI()
+    start_websocket_stream()
+    asyncio.run(trade_loop_async())
 
-class BotStartRequest(BaseModel):
-    api_key: str
-    api_secret: str
-    paper: bool
+    # Load historical data (replace with actual data loading logic)
+    try:
+        if data_client is None:
+            raise RuntimeError("Data client is not initialised for backtest.")
+        req_bt = StockBarsRequest(
+            symbol="AAPL",
+            timeframe=TimeFrame.Day,
+            start=None,
+            end=None,
+            limit=100
+        )
+        historical_data = data_client.get_stock_bars(req_bt).df
+    except Exception as e:
+        logging.error(f"Error fetching historical data: {e}")
+        historical_data = None
+        # Skip backtest if error
+        sys.exit(0)
 
-@app.post("/start-bot")
-async def start_bot_endpoint(request: BotStartRequest):
-    # Validate credentials before starting
-    if not request.api_key or not request.api_secret or not request.api_key.strip() or not request.api_secret.strip():
-        return {"status": "error", "detail": "Alpaca API key and secret are required."}
-    run_bot_with_keys(
-        api_key=request.api_key,
-        api_secret=request.api_secret,
-        paper=request.paper
-    )
-    return {"status": "Bot started"}
+    if historical_data is None or historical_data.empty:
+        logging.warning("Historical data is empty. Backtest aborted.")
+        sys.exit(0)
+
+    if hasattr(historical_data, 'index') and isinstance(historical_data.index, pd.MultiIndex):
+        historical_data = historical_data.xs("AAPL")
+    historical_data = historical_data.sort_index()
+
+    # Run backtest
+    final_equity = backtest("AAPL", historical_data)
+    print(f"Final equity after backtest: ${final_equity:.2f}")
+
+

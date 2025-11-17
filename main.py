@@ -1,4 +1,6 @@
-import ai_ticker_selector_aibotix
+import bot.ai_ticker_selector_aibotix as ai_ticker_selector_aibotix
+from bot.aibotix_trading_bot import init_trading_client, trade_loop_async
+import asyncio
 from fastapi import FastAPI, Request
 from threading import Thread
 import subprocess
@@ -34,7 +36,7 @@ except Exception as e:
 
 app = FastAPI()
 
-bot_processes = {"paper": None, "live": None}
+active_bots = {"paper": {}, "live": {}}
 
 def get_alpaca_keys(user_id: str, mode: str = "paper"):
     try:
@@ -93,22 +95,27 @@ async def start_bot(request: Request):
         return {"error": "Could not retrieve API keys."}
 
     api_key_id, api_secret = creds
-    selected_tickers = ai_ticker_selector_aibotix.get_top_tickers_from_api_keys(api_key_id, api_secret, mode)
+
+    # Run Stage A: Screen and collect data (async)
+    results = await ai_ticker_selector_aibotix.stage_a_screen_and_collect(limit=5)
+
+    # Log results for learning
+    ai_ticker_selector_aibotix.log_selected_tickers_for_learning(results)
+
+    # Score and rank tickers
+    selected_tickers = ai_ticker_selector_aibotix.score_tickers(results)
+
     print(f"[{mode.upper()}] AI selected tickers: {selected_tickers}")
 
     if not selected_tickers:
         print(f"[{mode.upper()}] No tickers selected — waiting for market signals.")
 
-    env = os.environ.copy()
-    env["APCA_API_KEY_ID"] = api_key_id
-    env["APCA_API_SECRET_KEY"] = api_secret
+    # Initialize dynamic per-user trading client
+    init_trading_client(api_key_id, api_secret, paper=(mode == "paper"))
 
-    bot_processes[mode] = subprocess.Popen(
-        ["python", "aibotix_trading_bot.py"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env
-    )
+    # Launch user-specific async trading task
+    task = asyncio.create_task(trade_loop_async())
+    active_bots[mode][user_id] = task
     try:
         supabase.table("bot_status").upsert({
             "user_id": user_id,
@@ -128,10 +135,10 @@ async def stop_bot(request: Request):
     user_id = body.get("user_id")
     mode = body.get("mode", "paper")
 
-    process = bot_processes.get(mode)
-    if process:
-        process.terminate()
-        bot_processes[mode] = None
+    task = active_bots[mode].get(user_id)
+    if task:
+        task.cancel()
+        active_bots[mode][user_id] = None
         print(f"[{mode.upper()}] Bot stopped successfully.")
         try:
             supabase.table("bot_status").upsert({

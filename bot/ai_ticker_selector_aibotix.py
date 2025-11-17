@@ -19,16 +19,25 @@ from alpaca.trading.enums import AssetStatus
 # --- Load Environment Variables ---
 load_dotenv()
 
+# --- Dynamic Client Initialization ---
+def init_clients():
+    api_key = os.getenv("APCA_API_KEY_ID")
+    api_secret = os.getenv("APCA_API_SECRET_KEY")
+    mode = os.getenv("BOT_MODE", "paper")
+    paper = mode.lower() == "paper"
 
-# --- Logger Setup ---
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-def create_clients(api_key, api_secret, paper=True):
     data_client = StockHistoricalDataClient(api_key, api_secret)
     trading_client = TradingClient(api_key, api_secret, paper=paper)
     return data_client, trading_client
 
+# --- Logger Setup ---
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+
 RSI_PERIOD = 14
+
+# Limits to control how many symbols we screen each run
+MAX_TRADABLE_SCREEN = 400  # how many symbols to volume-screen
+MAX_INDICATOR_TASKS = 60   # how many symbols to fetch intraday indicators for
 
 def compute_rsi(series, period):
     delta = series.diff()
@@ -44,8 +53,9 @@ def compute_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-async def fetch_indicators(symbol, data_client):
+async def fetch_indicators(symbol):
     try:
+        data_client, trading_client = init_clients()
         bars_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=100)
         bars = data_client.get_stock_bars(bars_req).df
         if bars.empty:
@@ -65,9 +75,11 @@ async def fetch_indicators(symbol, data_client):
         return df
     except Exception as e:
         logging.warning(f"Fetch failed for {symbol}: {e}")
-        raise  # Temporarily raise for debugging
+        # Do not raise here – return None so other symbols can still be processed
+        return None
 
-async def stage_a_screen_and_collect(data_client, trading_client, limit=5):
+async def stage_a_screen_and_collect(limit=5):
+    data_client, trading_client = init_clients()
     failed_symbols = []  # Initialize the failed_symbols list
     try:
         assets = trading_client.get_all_assets()
@@ -81,19 +93,28 @@ async def stage_a_screen_and_collect(data_client, trading_client, limit=5):
     logging.info(f"[DEBUG] Total tradable symbols retrieved: {len(tradable)}")
     logging.info(f"[DEBUG] First 10 tradable symbols: {tradable[:10]}")
     volume_filtered = []
-    for symbol in tradable[:1000]:  # Increased from 300 to 1000
+    for symbol in tradable[:MAX_TRADABLE_SCREEN]:
         try:
             logging.info(f"Checking symbol: {symbol}")
             d_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=1)
             bars = data_client.get_stock_bars(d_req).df
-            if len(volume_filtered) < 5:
-                logging.info(f"[DEBUG] {symbol} - Volume: {bars.iloc[-1]['volume']}, Close: {bars.iloc[-1]['close']}, Dollar Volume: {bars.iloc[-1]['volume'] * bars.iloc[-1]['close']}")
+
+            # If no data, mark as failed and skip *before* trying to access bars.iloc[-1]
             if bars.empty:
                 failed_symbols.append(symbol)
                 if len(failed_symbols) <= 10:
                     logging.warning(f"[DEBUG] {symbol} failed - empty bars.")
                 logging.warning(f"{symbol} returned empty bars.")
                 continue
+
+            # Now it's safe to inspect the last bar for debug logging
+            if len(volume_filtered) < 5:
+                logging.info(
+                    f"[DEBUG] {symbol} - Volume: {bars.iloc[-1]['volume']}, "
+                    f"Close: {bars.iloc[-1]['close']}, "
+                    f"Dollar Volume: {bars.iloc[-1]['volume'] * bars.iloc[-1]['close']}"
+                )
+
             vol = bars.iloc[-1]['volume']
             close = bars.iloc[-1]['close']
             dollar_volume = vol * close
@@ -108,16 +129,29 @@ async def stage_a_screen_and_collect(data_client, trading_client, limit=5):
     random.shuffle(volume_filtered)
 
     indicator_results = []
-    tasks = [fetch_indicators(sym, data_client) for sym in volume_filtered[:100]]
-    results = await asyncio.gather(*tasks)
 
-    for symbol, df in zip(volume_filtered[:100], results):
+    # Limit how many symbols we fetch intraday indicators for
+    symbols_for_indicators = volume_filtered[:MAX_INDICATOR_TASKS]
+
+    if not symbols_for_indicators:
+        logging.warning("No symbols passed the volume filter; returning empty indicator results.")
+        return []
+
+    tasks = [fetch_indicators(sym) for sym in symbols_for_indicators]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for symbol, df in zip(symbols_for_indicators, results):
+        # Skip any exceptions returned by asyncio.gather
+        if isinstance(df, Exception):
+            logging.warning(f"Indicator task for {symbol} raised an exception: {df}")
+            continue
+
         if df is not None and len(df) > 10:
             latest = df.iloc[-1]
             logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
             indicator_results.append((symbol, latest))
 
-    logging.info(f"{len(indicator_results)} tickers gathered with indicators.")
+    logging.info(f"{len(indicator_results)} tickers gathered with indicators after screening.")
     return indicator_results
 
 
@@ -131,8 +165,14 @@ def score_tickers(indicator_results, top_n=5):
         slope = data['slope']
         gap = data['gap']
 
-        if pd.isna(rsi) or pd.isna(atr) or pd.isna(slope) or pd.isna(gap):
+        # Require at least RSI and ATR; treat missing slope/gap as neutral
+        if pd.isna(rsi) or pd.isna(atr):
             continue
+
+        if pd.isna(slope):
+            slope = 0.0
+        if pd.isna(gap):
+            gap = 0.0
 
         score = 0
         if 40 <= rsi <= 70:
@@ -221,14 +261,10 @@ def record_trade_feedback(symbol, profit, filename="ai_ticker_feedback.csv"):
     except Exception as e:
         logging.warning(f"Failed to record feedback: {e}")
 
-
-# New async function to be called externally (e.g., from main.py)
-async def get_top_tickers_from_api_keys(api_key, api_secret, top_n=5, paper=True):
-    data_client, trading_client = create_clients(api_key, api_secret, paper=paper)
-    indicator_results = await stage_a_screen_and_collect(data_client, trading_client)
-    log_selected_tickers_for_learning(indicator_results)
-    top_tickers = score_tickers(indicator_results, top_n=top_n)
-    return top_tickers
+if __name__ == "__main__":
+    results = asyncio.run(stage_a_screen_and_collect())
+    log_selected_tickers_for_learning(results)
+    top = score_tickers(results)
 
 def get_top_tickers(indicator_log_csv='ai_ticker_learning_log.csv', top_n=5):
     try:

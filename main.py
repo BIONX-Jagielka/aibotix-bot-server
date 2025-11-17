@@ -37,6 +37,7 @@ except Exception as e:
 app = FastAPI()
 
 active_bots = {"paper": {}, "live": {}}
+bot_processes = {"paper": None, "live": None}
 
 def get_alpaca_keys(user_id: str, mode: str = "paper"):
     try:
@@ -72,19 +73,18 @@ def read_root():
 @app.get("/api/status")
 async def get_status():
     return {
-        "paper_running": bot_processes["paper"] is not None,
-        "live_running": bot_processes["live"] is not None,
+        "paper_running": any(active_bots["paper"].values()),
+        "live_running": any(active_bots["live"].values()),
         "updated_at": datetime.utcnow().isoformat()
     }
 
 @app.post("/api/start")
 async def start_bot(request: Request):
-    global bot_processes
     body = await request.json()
     user_id = body.get("user_id")
     mode = body.get("mode", "paper")
 
-    if bot_processes[mode] is not None:
+    if any(active_bots[mode].values()):
         return {"message": f"{mode.capitalize()} bot already running."}
 
     if not user_id:
@@ -130,7 +130,6 @@ async def start_bot(request: Request):
 
 @app.post("/api/stop")
 async def stop_bot(request: Request):
-    global bot_processes
     body = await request.json()
     user_id = body.get("user_id")
     mode = body.get("mode", "paper")

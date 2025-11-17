@@ -604,7 +604,8 @@ def stop_bot(signal, frame):
     global heartbeat_active
     heartbeat_active = False
     logging.info("Stopping bot and exiting.")
-    sys.exit(0)  # Gracefully exit the script
+    logging.info("Bot stopped gracefully (Render-safe).")
+    return
 
 signal.signal(signal.SIGINT, stop_bot)
 signal.signal(signal.SIGTERM, stop_bot)

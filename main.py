@@ -154,4 +154,13 @@ async def stop_bot(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    import os
+
+    print("🚀 Starting AIBOTIX bot server via uvicorn...")
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        log_level="info"
+    )

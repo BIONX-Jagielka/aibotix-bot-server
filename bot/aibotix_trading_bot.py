@@ -593,22 +593,15 @@ def update_trailing_stop(entry_price, current_price, trail_amount, previous_stop
 
 # Heartbeat monitoring
 heartbeat_active = True
+# Global run-state flag controlled by the server (start/stop endpoints)
+bot_running = True
 
 def heartbeat_monitor():
-    while heartbeat_active:
+    while heartbeat_active and bot_running:
         logging.info("Heartbeat: Bot is running.")
         time.sleep(300)  # Log every 5 minutes
 
-# Modify signal handler to terminate the bot completely
-def stop_bot(signal, frame):
-    global heartbeat_active
-    heartbeat_active = False
-    logging.info("Stopping bot and exiting.")
-    logging.info("Bot stopped gracefully (Render-safe).")
-    return
 
-signal.signal(signal.SIGINT, stop_bot)
-signal.signal(signal.SIGTERM, stop_bot)
 
 # Fallback mechanism for API calls
 def safe_api_call(api_function, *args, **kwargs):
@@ -643,11 +636,17 @@ def close_all_positions():
 # Prevent system from sleeping
 caffeine.on(display=True)
 
-# Asynchronous trade loop
+# Helper so the server can request a graceful stop without killing the whole process
+def request_bot_stop():
+    global bot_running, heartbeat_active
+    bot_running = False
+    heartbeat_active = False
+    logging.info("Bot stop requested (bot_running=False). Trading loop will exit gracefully.")
+
 async def trade_loop_async():
-    global consecutive_losses, TICKERS
+    global consecutive_losses, TICKERS, bot_running
     # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
-    while True:
+    while bot_running:
         if not is_market_open():
             logging.info("Market is currently closed. Waiting for market to open before fetching tickers...")
             await asyncio.sleep(300)
@@ -657,6 +656,9 @@ async def trade_loop_async():
         retry_delay = 60  # seconds
 
         for attempt in range(1, max_attempts + 1):
+            if not bot_running:
+                logging.info("Bot stop requested while waiting for AI ticker selector. Exiting trade_loop_async.")
+                return
             selected_tickers = get_top_tickers()
             if selected_tickers:
                 logging.info(f"Top tickers received: {selected_tickers}")
@@ -666,13 +668,19 @@ async def trade_loop_async():
                 await asyncio.sleep(retry_delay)
         else:
             logging.error("AI Ticker Selector failed to return tickers after multiple attempts. Exiting trading loop.")
-            continue  # Or use `break` if you want to end the trading loop entirely
+            continue  # try again on next cycle
+
         TICKERS = selected_tickers
         if TICKERS:
             break
+
+    if not bot_running:
+        logging.info("Bot stop requested before trading loop start. Exiting trade_loop_async.")
+        return
+
     logging.info(f"Selected tickers for trading: {TICKERS}")
     last_ticker_refresh = datetime.datetime.now(ny_tz)
-    while True:
+    while bot_running:
         try:
             # Step 3: daily resets & halts
             reset_daily_limits_if_new_day()
@@ -754,6 +762,7 @@ async def trade_loop_async():
         except Exception as e:
             logging.critical(f"Critical error in trade_loop: {e}")
             await asyncio.sleep(300)  # Wait before retrying
+    logging.info("trade_loop_async has exited because bot_running was set to False.")
 
 # Process a single ticker asynchronously
 async def process_ticker(ticker):

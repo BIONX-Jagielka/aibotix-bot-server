@@ -1,5 +1,5 @@
 import bot.ai_ticker_selector_aibotix as ai_ticker_selector_aibotix
-from bot.aibotix_trading_bot import init_trading_client, trade_loop_async
+from bot.aibotix_trading_bot import init_trading_client, trade_loop_async, request_bot_stop
 import asyncio
 from fastapi import FastAPI, Request
 from threading import Thread
@@ -136,9 +136,18 @@ async def stop_bot(request: Request):
 
     task = active_bots[mode].get(user_id)
     if task:
-        task.cancel()
+        # Ask the trading bot loop to stop cleanly
+        request_bot_stop()
+
+        # Cancel the asyncio task if still alive
+        try:
+            task.cancel()
+        except Exception:
+            pass
+
         active_bots[mode][user_id] = None
-        print(f"[{mode.upper()}] Bot stopped successfully.")
+        print(f"[{mode.upper()}] Bot stop requested successfully.")
+
         try:
             supabase.table("bot_status").upsert({
                 "user_id": user_id,
@@ -148,6 +157,7 @@ async def stop_bot(request: Request):
             }).execute()
         except Exception as e:
             print(f"[{mode.upper()}] Warning: could not update bot status on stop.")
+
         return {"message": f"{mode.capitalize()} bot stopped successfully."}
     else:
         return {"message": f"No {mode} bot is currently running."}

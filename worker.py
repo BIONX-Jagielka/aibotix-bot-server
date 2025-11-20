@@ -23,7 +23,7 @@ logger = logging.getLogger("aibotix.worker")
 # ----------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-FERNET_KEY = os.environ.get("FERNET_KEY")
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set for worker")
@@ -31,13 +31,13 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 fernet: Optional[Fernet] = None
-if FERNET_KEY:
+if ENCRYPTION_KEY:
     try:
-        fernet = Fernet(FERNET_KEY.encode())
+        fernet = Fernet(ENCRYPTION_KEY.encode())
     except Exception as e:
-        logger.error("Invalid FERNET_KEY in worker: %s", e)
+        logger.error("Invalid ENCRYPTION_KEY in worker: %s", e)
 else:
-    logger.warning("FERNET_KEY not set; worker cannot decrypt Alpaca secrets")
+    logger.warning("ENCRYPTION_KEY not set; worker cannot decrypt Alpaca secrets")
 
 
 # ----------------------------------------
@@ -148,7 +148,7 @@ def decrypt_secret(enc: str) -> Optional[str]:
     if not enc:
         return None
     if not fernet:
-        logger.error("FERNET_KEY not available; cannot decrypt Alpaca secret")
+        logger.error("ENCRYPTION_KEY not available; cannot decrypt Alpaca secret")
         return None
     try:
         return fernet.decrypt(enc.encode()).decode()

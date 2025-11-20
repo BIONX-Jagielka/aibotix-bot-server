@@ -131,6 +131,10 @@ def read_root():
 
 
 @app.get("/api/status")
+@app.get("/status")
+async def get_status_alias(user_id: Optional[str] = None):
+    return await get_status(user_id)
+
 async def get_status(user_id: Optional[str] = None):
     """
     Return bot running status.

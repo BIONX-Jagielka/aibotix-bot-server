@@ -287,6 +287,23 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     e,
                 )
                 await update_bot_error(user_id, mode, f"Bot crashed: {e!r}")
+                # Mark unexpected shutdown for UI indicator
+                def _mark_unexpected():
+                    return (
+                        supabase.table("bot_status")
+                        .update({
+                            "unexpected_shutdown": True,
+                            "stop_time": "now()",
+                            "updated_at": "now()"
+                        })
+                        .eq("user_id", user_id)
+                        .eq("mode", mode)
+                        .execute()
+                    )
+                try:
+                    await _run_supabase(_mark_unexpected)
+                except Exception:
+                    logger.exception("Failed to mark unexpected shutdown for user_id=%s mode=%s", user_id, mode)
 
         # Create and track the new task
         bot_tasks[task_key] = asyncio.create_task(run_bot_task())

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from typing import Dict, Any, Optional
+from datetime import datetime
 
 from cryptography.fernet import Fernet, InvalidToken
 from supabase import create_client, Client
@@ -141,6 +142,33 @@ async def clear_bot_error(user_id: str, mode: str) -> None:
         logger.exception("Failed to clear bot error for user_id=%s mode=%s", user_id, mode)
 
 
+async def log_activity(user_id: str, mode: str, message: str) -> None:
+    """Insert a log entry into bot_logs."""
+    def _insert():
+        return (
+            supabase.table("bot_logs")
+            .insert(
+                {
+                    "user_id": user_id,
+                    "mode": mode,
+                    "message": message,
+                    "created_at": datetime.utcnow().isoformat(),
+                }
+            )
+            .execute()
+        )
+
+    try:
+        await _run_supabase(_insert)
+    except Exception:
+        logger.exception(
+            "Failed to insert bot_logs entry for user_id=%s, mode=%s: %s",
+            user_id,
+            mode,
+            message,
+        )
+
+
 # ----------------------------------------
 # Crypto helper
 # ----------------------------------------
@@ -219,6 +247,8 @@ async def worker_loop(poll_interval: int = 10) -> None:
             # Clear last_error on successful startup
             await clear_bot_error(user_id, mode)
 
+            await log_activity(user_id, mode, f"Bot starting (strategy={strategy_id})")
+
             try:
                 logger.info(
                     "▶️ Starting bot for user_id=%s, mode=%s, strategy=%s",
@@ -234,6 +264,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     user_id=user_id,
                     strategy_id=strategy_id,
                 )
+                await log_activity(user_id, mode, "trade_loop_async finished normally")
                 # If trade_loop_async returns normally, we just log and the worker
                 # will decide whether to restart it on the next poll, depending on is_running.
                 logger.info(
@@ -243,9 +274,11 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     strategy_id,
                 )
             except asyncio.CancelledError:
+                await log_activity(user_id, mode, "Bot task cancelled")
                 logger.info("⏹ Bot task cancelled for %s", task_key)
                 raise
             except Exception as e:
+                await log_activity(user_id, mode, f"Bot crashed: {e!r}")
                 logger.exception(
                     "Bot crashed for %s (user_id=%s, mode=%s): %s",
                     task_key,
@@ -262,6 +295,23 @@ async def worker_loop(poll_interval: int = 10) -> None:
     while True:
         try:
             active_rows = await fetch_active_bots()
+            # Update heartbeat for all active bots
+            for row in active_rows:
+                uid = str(row.get("user_id"))
+                mode = row.get("mode", "paper")
+                def _hb():
+                    return (
+                        supabase.table("bot_status")
+                        .update({"last_heartbeat": "now()"})
+                        .eq("user_id", uid)
+                        .eq("mode", mode)
+                        .execute()
+                    )
+                try:
+                    await _run_supabase(_hb)
+                except Exception:
+                    logger.exception("Failed to update heartbeat for %s:%s", uid, mode)
+
             # Build the set of keys that *should* be running right now
             active_keys = {
                 f"{str(r.get('user_id'))}:{r.get('mode', 'paper')}"
@@ -277,6 +327,8 @@ async def worker_loop(poll_interval: int = 10) -> None:
             for key, task in list(bot_tasks.items()):
                 if key not in active_keys:
                     logger.info("🛑 Stopping bot for %s (is_running flag turned off)", key)
+                    uid, mode = key.split(":", 1)
+                    await log_activity(uid, mode, "Bot stopping due to is_running=False")
                     task.cancel()
                     try:
                         await task

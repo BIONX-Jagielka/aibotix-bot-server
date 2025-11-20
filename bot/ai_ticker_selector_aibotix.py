@@ -62,6 +62,11 @@ async def fetch_indicators(symbol):
             logging.warning(f"No data returned for {symbol}")
             return None
 
+        # Require a minimum number of bars so ATR / EMA / volume windows have data
+        if len(bars) < 30:
+            logging.warning(f"Not enough intraday bars for {symbol}, skipping.")
+            return None
+
         df = bars.copy()
         df['rsi'] = compute_rsi(df['close'], RSI_PERIOD)
         df['atr'] = compute_atr(df)
@@ -118,7 +123,8 @@ async def stage_a_screen_and_collect(limit=5):
             vol = bars.iloc[-1]['volume']
             close = bars.iloc[-1]['close']
             dollar_volume = vol * close
-            if vol > 100 and dollar_volume > 1_000 and close > 0.01:
+            # Slightly relaxed filters so we don't end up with zero candidates in quiet sessions
+            if vol > 50 and dollar_volume > 500 and close > 0.01:
                 volume_filtered.append(symbol)
         except Exception as e:
             logging.warning(f"Error processing {symbol}: {e}")
@@ -165,10 +171,19 @@ def score_tickers(indicator_results, top_n=5):
         slope = data['slope']
         gap = data['gap']
 
-        # Require at least RSI and ATR; treat missing slope/gap as neutral
-        if pd.isna(rsi) or pd.isna(atr):
+        # Require RSI, but make other indicators robust to NaNs by using safe defaults
+        if pd.isna(rsi):
             continue
 
+        # If ATR is missing or zero/negative, treat as neutral (avoid division-by-zero logic elsewhere)
+        if pd.isna(atr) or atr <= 0:
+            atr = 1.0
+
+        # Treat missing volume_ratio as neutral (1.0 means "normal" volume)
+        if pd.isna(volume_ratio) or volume_ratio <= 0:
+            volume_ratio = 1.0
+
+        # Treat missing slope/gap as flat / no gap
         if pd.isna(slope):
             slope = 0.0
         if pd.isna(gap):

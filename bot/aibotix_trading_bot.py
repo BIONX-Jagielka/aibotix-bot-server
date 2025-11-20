@@ -1,8 +1,6 @@
-from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import MACD
-import websockets
-import json
 from alpaca.trading.client import TradingClient
 # Alpaca v3 trading enums and order request
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -14,22 +12,11 @@ import datetime
 import pytz
 import numpy as np
 import os
-import sys
 from dotenv import load_dotenv
 import logging
 import asyncio
-import signal
-import threading
-import matplotlib.pyplot as plt
 import random
 from bot.ai_ticker_selector_aibotix import get_top_tickers
-try:
-    import caffeine
-except Exception:
-    class _CaffeineShim:
-        def on(self, display: bool = True):
-            pass
-    caffeine = _CaffeineShim()
 
 # Alpaca data API imports for historical and latest trade data (v3)
 from alpaca.data.historical import StockHistoricalDataClient
@@ -37,8 +24,45 @@ from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 
-import os
-from dotenv import load_dotenv
+# --- Supabase Logging Integration (Patch 1) ---
+from supabase import create_client
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logging.info("Supabase logging initialised.")
+    except Exception as e:
+        logging.error(f"Failed to initialise Supabase client: {e}")
+
+else:
+    logging.warning("Supabase credentials missing — logging disabled.")
+
+# Per-bot context (set by init_trading_client so logs are multi-user aware)
+USER_ID: str | None = None
+CURRENT_MODE: str | None = None  # 'paper' or 'live'
+
+def supabase_log(message: str) -> None:
+    """Best-effort log to Supabase bot_logs table.
+
+    We only log when Supabase is configured *and* we know which user/mode
+    this bot is running for. If schema or network issues occur, they are
+    swallowed and only logged locally so trading is never blocked.
+    """
+    global supabase, USER_ID, CURRENT_MODE
+    if supabase is None or USER_ID is None or CURRENT_MODE is None:
+        return
+    try:
+        supabase.table("bot_logs").insert({
+            "user_id": USER_ID,
+            "mode": CURRENT_MODE,
+            "message": message,
+        }).execute()
+    except Exception as e:
+        logging.error(f"Supabase log error: {e}")
 
 load_dotenv()
 
@@ -99,20 +123,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 # === Step 2: Dynamic per-user API initialization (Supabase-ready) ===
-def init_trading_client(api_key: str, api_secret: str, paper: bool = True):
+def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_id: str | None = None, mode: str | None = None):
+    """Initialise a TradingClient and data client instance for a specific user.
+
+    This is called by the worker/start route with decrypted, per-user API
+    keys loaded from Supabase. We keep the original (api_key, api_secret, paper)
+    signature for backwards compatibility and accept optional user_id/mode so
+    Supabase logging can be multi-user aware.
     """
-    Initialise a TradingClient and data client instance for a specific user.
-    Called by the bot start route with user-specific API keys from Supabase,
-    or from __main__ when running this module directly.
-    """
-    global api, data_client, API_KEY, API_SECRET
+    global api, data_client, API_KEY, API_SECRET, USER_ID, CURRENT_MODE
+
     API_KEY = api_key
     API_SECRET = api_secret
+
+    # Store per-bot context so logs know who/what this bot belongs to
+    USER_ID = user_id
+    CURRENT_MODE = mode or ("paper" if paper else "live")
 
     api = TradingClient(api_key, api_secret, paper=paper)
     data_client = StockHistoricalDataClient(api_key, api_secret)
 
-    logging.info(f"Trading client initialised (paper={paper}).")
+    logging.info(f"Trading client initialised (paper={paper}, mode={CURRENT_MODE}).")
+    supabase_log(f"Trading client initialised (mode={CURRENT_MODE}, paper={paper}).")
     return api
 
 # Global placeholder. Start/stop routes will set this dynamically.
@@ -120,7 +152,6 @@ api: TradingClient | None = None
 
 ny_tz = pytz.timezone('America/New_York')
 
-trade_log = []
 consecutive_losses = 0
 last_trade_time = {}
 
@@ -317,6 +348,26 @@ def get_position(symbol):
     except Exception:
         return 0, 0
 
+# --- Async helpers for blocking calls ---
+
+async def is_market_open_async(ticker=None):
+    """
+    Async wrapper for is_market_open so we don't block the event loop with API calls.
+    """
+    return await asyncio.to_thread(is_market_open, ticker)
+
+
+async def get_position_async(symbol):
+    """
+    Async wrapper for get_position so Alpaca calls run in a thread, not the event loop.
+    """
+    return await asyncio.to_thread(get_position, symbol)
+
+
+def ny_now():
+    """Shorthand for now in NY timezone."""
+    return datetime.datetime.now(ny_tz)
+
 # --- Trading Logic ---
 class RateLimitError(Exception):
     pass
@@ -366,6 +417,11 @@ def place_order(symbol, qty, side):
         logging.info(f"Order {side.upper()} {symbol} @ {datetime.datetime.now(ny_tz)} with quantity {qty}")
         last_trade_time[symbol] = datetime.datetime.now(ny_tz)
 
+        # --- Supabase log order submitted (schema-safe) ---
+        supabase_log(
+            f"order_submitted | {side.upper()} {symbol} qty={qty} @ {datetime.datetime.now(ny_tz).isoformat()}"
+        )
+
         if side.lower() == 'sell':
             trade_history[symbol] = trade_history.get(symbol, {})
             trade_history[symbol]['last_sell'] = datetime.datetime.now(ny_tz)
@@ -397,6 +453,10 @@ def close_position(symbol):
             api.close_position(symbol)
             logging.info(f"Closed position on {symbol}")
             last_trade_time[symbol] = datetime.datetime.now(ny_tz)
+            # --- Supabase log position closed (PnL unknown) ---
+            supabase_log(
+                f"position_closed | {symbol} | pnl=unknown @ {datetime.datetime.now(ny_tz).isoformat()}"
+            )
             return 0.0
         pnl = (current_price - entry_price) * pos_qty
         api.close_position(symbol)
@@ -411,6 +471,10 @@ def close_position(symbol):
         trade_history[symbol]['last_sell'] = datetime.datetime.now(ny_tz)
         # Register outcome for streaks/halts
         _register_trade_outcome(symbol, pnl)
+        # --- Supabase log position closed ---
+        supabase_log(
+            f"position_closed | {symbol} | pnl={pnl:.2f} @ {datetime.datetime.now(ny_tz).isoformat()}"
+        )
         return pnl
     except Exception as e:
         logging.error(f"Failed to close {symbol}: {e}")
@@ -438,6 +502,15 @@ def update_pnl():
         except Exception as e:
             logging.error(f"P&L calc error for {position.symbol}: {e}")
     logging.info(f"Realized P&L: ${realized_pnl:.2f}, Unrealized P&L: ${unrealized_pnl:.2f}")
+    # Optional: lightweight log line into bot_logs (does not assume bot_status schema)
+    supabase_log(
+        f"pnl_update | realized={realized_pnl:.2f} unrealized={unrealized_pnl:.2f} equity={get_equity():.2f}"
+    )
+
+# Patch 2.1: Add async wrapper for P&L update
+async def update_pnl_async():
+    """Async wrapper so P&L updates don’t block the event loop."""
+    await asyncio.to_thread(update_pnl)
 
 def calculate_position_size(symbol, risk_per_trade):
     equity = get_equity()
@@ -603,51 +676,47 @@ def heartbeat_monitor():
 
 
 
-# Fallback mechanism for API calls
-def safe_api_call(api_function, *args, **kwargs):
+async def safe_api_call(api_function, *args, **kwargs):
     retries = 5
-    delay = 1  # Start with 1 second delay
-
+    delay = 1
     for attempt in range(retries):
         try:
-            return api_function(*args, **kwargs)
+            return await asyncio.to_thread(api_function, *args, **kwargs)
         except Exception as e:
             logging.error(f"API call failed: {e}. Retrying in {delay} seconds...")
-            time.sleep(delay)
-            delay *= 2  # Exponential backoff
-
+            await asyncio.sleep(delay)
+            delay *= 2
     logging.critical("API call failed after multiple retries.")
     return None
 
-# Market close handling
-def close_all_positions():
+async def close_all_positions():
     if api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return
     try:
-        positions = api.get_all_positions()
+        positions = await asyncio.to_thread(api.get_all_positions)
         for position in positions:
             symbol = position.symbol
             logging.info(f"Closing position for {symbol}.")
-            safe_api_call(api.close_position, symbol)
+            await safe_api_call(api.close_position, symbol)
     except Exception as e:
         logging.error(f"Failed to close all positions: {e}")
 
-# Prevent system from sleeping
-caffeine.on(display=True)
 
 # Helper so the server can request a graceful stop without killing the whole process
 def request_bot_stop():
     global bot_running, heartbeat_active
     bot_running = False
     heartbeat_active = False
+    # --- Supabase log bot stop requested ---
+    supabase_log(f"bot_stop_requested @ {datetime.datetime.now(ny_tz).isoformat()}")
     logging.info("Bot stop requested (bot_running=False). Trading loop will exit gracefully.")
 
 async def trade_loop_async():
     global consecutive_losses, TICKERS, bot_running
     # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
     while bot_running:
-        if not is_market_open():
+        if not await is_market_open_async():
             logging.info("Market is currently closed. Waiting for market to open before fetching tickers...")
             await asyncio.sleep(300)
             continue
@@ -679,7 +748,7 @@ async def trade_loop_async():
         return
 
     logging.info(f"Selected tickers for trading: {TICKERS}")
-    last_ticker_refresh = datetime.datetime.now(ny_tz)
+    last_ticker_refresh = ny_now()
     while bot_running:
         try:
             # Step 3: daily resets & halts
@@ -691,46 +760,61 @@ async def trade_loop_async():
 
             logging.info("Bot is evaluating trade opportunities...")
             # Refresh tickers every hour
-            now = datetime.datetime.now(ny_tz)
+            now = ny_now()
             if (now - last_ticker_refresh).total_seconds() > 3600:
                 TICKERS = await asyncio.to_thread(get_top_tickers, 5)
                 logging.info(f"Selected tickers for trading: {TICKERS}")
                 last_ticker_refresh = now
 
-            if not is_market_open():
+            if not await is_market_open_async():
                 logging.info("Market closed. Sleeping 5 mins...")
                 await asyncio.sleep(300)
                 continue
 
-            # Check if market is about to close
-            clock = safe_api_call(api.get_clock)
-            if clock and clock.next_close - clock.timestamp < datetime.timedelta(minutes=15):
-                logging.info("Market is about to close. Closing all positions.")
-                close_all_positions()
-                await asyncio.sleep(900)  # Wait until market reopens
-                continue
+            # Check if market is about to close (non-blocking API call)
+            clock = await safe_api_call(api.get_clock)
+            if clock and hasattr(clock, "next_close") and hasattr(clock, "timestamp"):
+                # Some Alpaca clock objects use .timestamp, others may expose .next_close differently
+                try:
+                    time_to_close = clock.next_close - clock.timestamp
+                except Exception:
+                    time_to_close = None
 
-            update_pnl()  # Track P&L
+                if time_to_close is not None and time_to_close < datetime.timedelta(minutes=15):
+                    logging.info("Market is about to close. Closing all positions.")
+                    await close_all_positions()
+                    await asyncio.sleep(900)  # Wait until market reopens
+                    continue
+
+            # Track P&L without blocking the event loop
+            await update_pnl_async()
 
             # Intelligent ticker rotation: close positions no longer in top tickers if profitable
-            positions = api.get_all_positions()
+            try:
+                positions = await asyncio.to_thread(api.get_all_positions)
+            except Exception as e:
+                logging.error(f"Failed to fetch positions for rotation logic: {e}")
+                positions = []
+
             for position in positions:
                 symbol = position.symbol
                 if symbol not in TICKERS:
-                    unrealized = float(position.unrealized_plpc)
+                    try:
+                        unrealized = float(position.unrealized_plpc)
+                    except Exception:
+                        unrealized = 0.0
                     if unrealized > 0.01:  # At least 1% profit
                         logging.info(f"Closing {symbol} as it is no longer in top tickers and has profit.")
-                        close_position(symbol)
+                        await asyncio.to_thread(close_position, symbol)
 
-            trades_this_hour = 0
-            hour_start = datetime.datetime.now(ny_tz)
+            hour_start = ny_now()
 
             tasks = []
             for ticker in TICKERS:
-                if not is_market_open(ticker):
+                if not await is_market_open_async(ticker):
                     continue
 
-                now = datetime.datetime.now(ny_tz)
+                now = ny_now()
                 if ticker in last_trade_time and (now - last_trade_time[ticker]).total_seconds() < TRADE_SPACING_SECONDS:
                     continue  # honor trade spacing
 
@@ -740,7 +824,7 @@ async def trade_loop_async():
 
                 # Per-ticker cooldown after loss streak
                 cooloff_until = per_ticker_cooloff_until.get(ticker)
-                if cooloff_until and datetime.datetime.now(ny_tz) < cooloff_until:
+                if cooloff_until and ny_now() < cooloff_until:
                     logging.info(f"{ticker} cooling off until {cooloff_until}.")
                     continue
 
@@ -753,12 +837,15 @@ async def trade_loop_async():
                 await asyncio.sleep(LOSS_COOLDOWN)
                 consecutive_losses = 0
 
-            if (datetime.datetime.now(ny_tz) - hour_start).total_seconds() < 60:
+            if (ny_now() - hour_start).total_seconds() < 60:
                 await asyncio.sleep(30)
 
         except RateLimitError as e:
             logging.error(e)
             await asyncio.sleep(60)  # Wait before retrying
+        except asyncio.CancelledError:
+            logging.info("trade_loop_async was cancelled, exiting gracefully.")
+            return
         except Exception as e:
             logging.critical(f"Critical error in trade_loop: {e}")
             await asyncio.sleep(300)  # Wait before retrying
@@ -790,11 +877,11 @@ async def process_ticker(ticker):
             return
 
         # Position info
-        pos_qty, entry_price = get_position(ticker)
+        pos_qty, entry_price = await get_position_async(ticker)
         have_position = pos_qty > 0
 
         # Cooldowns after recent actions
-        now = datetime.datetime.now(ny_tz)
+        now = ny_now()
         last_sell_time = trade_history.get(ticker, {}).get("last_sell")
         if not have_position and last_sell_time:
             elapsed = (now - last_sell_time).total_seconds()
@@ -834,9 +921,9 @@ async def process_ticker(ticker):
                 pnl = close_position(ticker)
                 if should_halt_trading():
                     return
-                recently_traded[ticker] = datetime.datetime.now(ny_tz)
+                recently_traded[ticker] = ny_now()
                 trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_sell'] = datetime.datetime.now(ny_tz)
+                trade_history[ticker]['last_sell'] = ny_now()
                 logging.info(f"Trailing stop triggered for {ticker} at {new_stop:.2f}")
                 return
 
@@ -845,9 +932,9 @@ async def process_ticker(ticker):
                 pnl = close_position(ticker)
                 if should_halt_trading():
                     return
-                recently_traded[ticker] = datetime.datetime.now(ny_tz)
+                recently_traded[ticker] = ny_now()
                 trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_sell'] = datetime.datetime.now(ny_tz)
+                trade_history[ticker]['last_sell'] = ny_now()
                 logging.info(f"Take-profit exit for {ticker} at {close_price:.2f}")
                 return
 
@@ -856,9 +943,9 @@ async def process_ticker(ticker):
                 pnl = close_position(ticker)
                 if should_halt_trading():
                     return
-                recently_traded[ticker] = datetime.datetime.now(ny_tz)
+                recently_traded[ticker] = ny_now()
                 trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_sell'] = datetime.datetime.now(ny_tz)
+                trade_history[ticker]['last_sell'] = ny_now()
                 logging.info(f"Signal-based exit for {ticker} at {close_price:.2f} (score {score:.3f})")
             return
 
@@ -879,132 +966,15 @@ async def process_ticker(ticker):
                 return
             logging.info(f"ENTRY {ticker}: px={close_price:.2f}, qty={qty}, score={score:.3f}, rsi={rsi:.1f}, atr%={atr_pct:.3%}")
             if await place_order_async(ticker, qty, 'buy'):
-                recently_traded[ticker] = datetime.datetime.now(ny_tz)
+                recently_traded[ticker] = ny_now()
                 # initialize trailing stop
                 recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)
                 trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_buy'] = datetime.datetime.now(ny_tz)
+                trade_history[ticker]['last_buy'] = ny_now()
                 trade_history[ticker]['last_signal_score'] = float(score)
-                last_trade_time[ticker] = datetime.datetime.now(ny_tz)
+                last_trade_time[ticker] = ny_now()
 
     except Exception as e:
         logging.error(f"Error processing {ticker}: {e}")
-# Placeholder for real-time market data stream
-def start_websocket_stream():
-    logging.info("WebSocket streaming would be initialized here for live data.")
-
-# Backtesting function
-def backtest(ticker, historical_data):
-    logging.info(f"Starting backtest for {ticker}")
-
-    # Initialize variables
-    equity = 10000  # Starting equity in dollars
-    position = 0  # Current position size
-    entry_price = 0  # Entry price for the position
-    trade_log = []
-
-    # Apply strategy to historical data
-    historical_data = strategy.calculate_indicators(historical_data)
-
-    for i in range(len(historical_data)):
-        row = historical_data.iloc[i]
-        rsi = row['RSI']
-        atr = row['ATR']
-        close_price = row['close']
-
-        # Check buy condition
-        if position == 0 and rsi < 30:
-            position = equity // close_price  # Buy as many shares as possible
-            entry_price = close_price
-            equity -= position * close_price
-            trade_log.append((row.name, "BUY", close_price, position))
-
-        # Check sell condition
-        elif position > 0:
-            tp = entry_price + (TAKE_PROFIT_ATR_MULT * atr)
-            sl = entry_price - (STOP_LOSS_ATR_MULT * atr)
-
-            if close_price >= tp or rsi > 70 or close_price <= sl:
-                equity += position * close_price
-                trade_log.append((row.name, "SELL", close_price, position))
-                position = 0
-
-    # Final equity calculation
-    if position > 0:
-        equity += position * historical_data.iloc[-1]['close']
-
-    # Log results
-    logging.info(f"Backtest complete for {ticker}. Final equity: ${equity:.2f}")
-
-    # Plot results
-    plot_backtest_results(historical_data, trade_log, ticker)
-
-    return equity
-
-# Plot backtest results
-def plot_backtest_results(historical_data, trade_log, ticker):
-    plt.figure(figsize=(12, 6))
-    plt.plot(historical_data['close'], label='Close Price', color='blue')
-
-    for trade in trade_log:
-        date, action, price, _ = trade
-        color = 'green' if action == 'BUY' else 'red'
-        plt.scatter(date, price, color=color, label=action, alpha=0.8)
-
-    plt.title(f"Backtest Results for {ticker}")
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.show()
-
-# Entry point for the asynchronous bot
-if __name__ == "__main__":
-    # Standalone execution: initialise trading and data clients from environment variables.
-    env_key = os.getenv("ALPACA_API_KEY")
-    env_secret = os.getenv("ALPACA_API_SECRET")
-
-    if not env_key or not env_secret:
-        logging.error("Environment variables ALPACA_API_KEY / ALPACA_API_SECRET are not set. "
-                      "Cannot run standalone trading bot.")
-        sys.exit(1)
-
-    init_trading_client(env_key, env_secret, paper=True)
-
-    # Start heartbeat monitor in a separate thread
-    heartbeat_thread = threading.Thread(target=heartbeat_monitor, daemon=True)
-    heartbeat_thread.start()
-
-    start_websocket_stream()
-    asyncio.run(trade_loop_async())
-
-    # Load historical data (replace with actual data loading logic)
-    try:
-        if data_client is None:
-            raise RuntimeError("Data client is not initialised for backtest.")
-        req_bt = StockBarsRequest(
-            symbol="AAPL",
-            timeframe=TimeFrame.Day,
-            start=None,
-            end=None,
-            limit=100
-        )
-        historical_data = data_client.get_stock_bars(req_bt).df
-    except Exception as e:
-        logging.error(f"Error fetching historical data: {e}")
-        historical_data = None
-        # Skip backtest if error
-        sys.exit(0)
-
-    if historical_data is None or historical_data.empty:
-        logging.warning("Historical data is empty. Backtest aborted.")
-        sys.exit(0)
-
-    if hasattr(historical_data, 'index') and isinstance(historical_data.index, pd.MultiIndex):
-        historical_data = historical_data.xs("AAPL")
-    historical_data = historical_data.sort_index()
-
-    # Run backtest
-    final_equity = backtest("AAPL", historical_data)
-    print(f"Final equity after backtest: ${final_equity:.2f}")
 
 

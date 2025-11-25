@@ -1,3 +1,55 @@
+# --- BotSession container for state (Patch B foundation) ---
+# --- BotSession container for state (Patch B foundation) ---
+class BotSession:
+    def __init__(self):
+        self.USER_ID = None
+        self.CURRENT_MODE = None
+        self.api = None
+        self.data_client = None
+
+        # Core trading state
+        self.TICKERS = []
+        self.consecutive_losses = 0
+        self.last_trade_time = {}
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        self.start_of_day_equity = None
+        self.daily_realized_pnl = 0.0
+        self.trading_halted_until = None
+
+        # Per-ticker tracking
+        self.per_ticker_loss_streak = {}
+        self.per_ticker_cooloff_until = {}
+        self.recently_traded = {}
+        self.trade_history = {}
+
+# Multi-user session registry: one BotSession per (user_id, mode)
+SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
+
+
+def get_session(user_id: str | None, mode: str | None) -> "BotSession":
+    """
+    Return a BotSession for the given (user_id, mode) pair.
+
+    This is the foundation for multi-user support:
+    - Each (user_id, mode) has its own BotSession object
+    - The global SESSION is set to the session currently being used
+      by the worker/task so existing code keeps working.
+    """
+    global SESSION, SESSIONS
+    key: tuple[str | None, str | None] = (user_id, mode)
+    session = SESSIONS.get(key)
+    if session is None:
+        session = BotSession()
+        session.USER_ID = user_id
+        session.CURRENT_MODE = mode
+        SESSIONS[key] = session
+    # Make this session the "active" one for the current task/process
+    SESSION = session
+    return session
+
+# Global session instance (future: per-user instances in worker)
+SESSION = BotSession()
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import MACD
@@ -46,19 +98,16 @@ USER_ID: str | None = None
 CURRENT_MODE: str | None = None  # 'paper' or 'live'
 
 def supabase_log(message: str) -> None:
-    """Best-effort log to Supabase bot_logs table.
-
-    We only log when Supabase is configured *and* we know which user/mode
-    this bot is running for. If schema or network issues occur, they are
-    swallowed and only logged locally so trading is never blocked.
-    """
-    global supabase, USER_ID, CURRENT_MODE
-    if supabase is None or USER_ID is None or CURRENT_MODE is None:
+    global supabase, SESSION
+    # Use the active BotSession so logs are tied to the correct user/mode
+    user_id = getattr(SESSION, "USER_ID", None)
+    mode = getattr(SESSION, "CURRENT_MODE", None)
+    if supabase is None or user_id is None or mode is None:
         return
     try:
         supabase.table("bot_logs").insert({
-            "user_id": USER_ID,
-            "mode": CURRENT_MODE,
+            "user_id": user_id,
+            "mode": mode,
             "message": message,
         }).execute()
     except Exception as e:
@@ -124,27 +173,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # === Step 2: Dynamic per-user API initialization (Supabase-ready) ===
 def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_id: str | None = None, mode: str | None = None):
-    """Initialise a TradingClient and data client instance for a specific user.
+    global api, data_client, API_KEY, API_SECRET, USER_ID, CURRENT_MODE, SESSION
 
-    This is called by the worker/start route with decrypted, per-user API
-    keys loaded from Supabase. We keep the original (api_key, api_secret, paper)
-    signature for backwards compatibility and accept optional user_id/mode so
-    Supabase logging can be multi-user aware.
-    """
-    global api, data_client, API_KEY, API_SECRET, USER_ID, CURRENT_MODE
-
+    # Store raw keys for debugging/backwards compatibility (avoid using directly elsewhere)
     API_KEY = api_key
     API_SECRET = api_secret
 
-    # Store per-bot context so logs know who/what this bot belongs to
-    USER_ID = user_id
-    CURRENT_MODE = mode or ("paper" if paper else "live")
+    # Determine effective mode string
+    effective_mode = mode or ("paper" if paper else "live")
 
+    # Select or create a per-user BotSession
+    session = get_session(user_id, effective_mode)
+
+    # Keep module-level context for any legacy callers that still read USER_ID/CURRENT_MODE
+    USER_ID = user_id
+    CURRENT_MODE = effective_mode
+
+    # Create Alpaca trading & data clients
     api = TradingClient(api_key, api_secret, paper=paper)
     data_client = StockHistoricalDataClient(api_key, api_secret)
 
-    logging.info(f"Trading client initialised (paper={paper}, mode={CURRENT_MODE}).")
-    supabase_log(f"Trading client initialised (mode={CURRENT_MODE}, paper={paper}).")
+    # Attach them to the active session
+    session.api = api
+    session.data_client = data_client
+    session.USER_ID = user_id
+    session.CURRENT_MODE = effective_mode
+
+    # Also update the global SESSION reference so existing code uses this session
+    SESSION = session
+
+    logging.info(f"Trading client initialised (paper={paper}, mode={effective_mode}).")
+    supabase_log(f"Trading client initialised (mode={effective_mode}, paper={paper}).")
     return api
 
 # Global placeholder. Start/stop routes will set this dynamically.
@@ -152,28 +211,7 @@ api: TradingClient | None = None
 
 ny_tz = pytz.timezone('America/New_York')
 
-consecutive_losses = 0
-last_trade_time = {}
-
-# Add global variables to track P&L
-realized_pnl = 0.0
-unrealized_pnl = 0.0
-
-# Daily risk tracking
-start_of_day_equity = None
-daily_realized_pnl = 0.0
-trading_halted_until = None  # datetime when trading can resume
-
-# Per-ticker loss management
-per_ticker_loss_streak = {}       # {ticker: count}
-per_ticker_cooloff_until = {}     # {ticker: datetime}
-
-# Add a cooldown period for re-entry into the same stock
 REENTRY_COOLDOWN = 300  # 5 minutes
-recently_traded = {}
-
-# Track last buy/sell timestamps for each ticker
-trade_history = {}  # Tracks last buy/sell timestamps for each ticker
 
 # Alpaca data client for historical and latest trade data
 data_client: StockHistoricalDataClient | None = None
@@ -186,15 +224,14 @@ def _ny_now():
 
 def reset_daily_limits_if_new_day():
     """Reset daily counters if a new trading day has started."""
-    global start_of_day_equity, daily_realized_pnl, consecutive_losses, per_ticker_loss_streak, per_ticker_cooloff_until
     now = _ny_now().date()
     # Initialize on first run
-    if start_of_day_equity is None:
-        start_of_day_equity = get_equity()
-        daily_realized_pnl = 0.0
-        consecutive_losses = 0
-        per_ticker_loss_streak = {}
-        per_ticker_cooloff_until = {}
+    if SESSION.start_of_day_equity is None:
+        SESSION.start_of_day_equity = get_equity()
+        SESSION.daily_realized_pnl = 0.0
+        SESSION.consecutive_losses = 0
+        SESSION.per_ticker_loss_streak = {}
+        SESSION.per_ticker_cooloff_until = {}
         return
     # If date changed in NY timezone, reset
     if hasattr(reset_daily_limits_if_new_day, "_last_date"):
@@ -202,19 +239,19 @@ def reset_daily_limits_if_new_day():
     else:
         last_date = now
     if now != last_date:
-        start_of_day_equity = get_equity()
-        daily_realized_pnl = 0.0
-        consecutive_losses = 0
-        per_ticker_loss_streak = {}
-        per_ticker_cooloff_until = {}
+        SESSION.start_of_day_equity = get_equity()
+        SESSION.daily_realized_pnl = 0.0
+        SESSION.consecutive_losses = 0
+        SESSION.per_ticker_loss_streak = {}
+        SESSION.per_ticker_cooloff_until = {}
     reset_daily_limits_if_new_day._last_date = now
 
 
 def _calc_daily_loss_limit():
     """Return the dollar loss limit for the current day based on start_of_day_equity and optional hard cap."""
-    if start_of_day_equity is None:
+    if SESSION.start_of_day_equity is None:
         return None
-    pct_cap = start_of_day_equity * DAILY_MAX_LOSS_PCT if DAILY_MAX_LOSS_PCT else None
+    pct_cap = SESSION.start_of_day_equity * DAILY_MAX_LOSS_PCT if DAILY_MAX_LOSS_PCT else None
     if DAILY_MAX_LOSS_DOLLARS is None:
         return pct_cap
     return max(DAILY_MAX_LOSS_DOLLARS, pct_cap or 0.0)
@@ -222,52 +259,70 @@ def _calc_daily_loss_limit():
 
 def should_halt_trading():
     """True if trading should be halted due to daily loss cap, manual cooldown, or market close proximity."""
-    global trading_halted_until
-    # Manual/automatic halt window
     now = datetime.datetime.now(ny_tz)
-    if trading_halted_until and now < trading_halted_until:
+    if SESSION.trading_halted_until and now < SESSION.trading_halted_until:
         return True
     # Daily drawdown check
     loss_limit = _calc_daily_loss_limit()
-    if loss_limit is not None and daily_realized_pnl <= -abs(loss_limit):
+    if loss_limit is not None and SESSION.daily_realized_pnl <= -abs(loss_limit):
         # Halt until next market open
+        if SESSION.api is None:
+            logging.error("Trading client not initialised. Cannot check clock for halt logic.")
+            SESSION.trading_halted_until = now + datetime.timedelta(hours=24)
+            return True
         try:
-            clock = api.get_clock()
+            clock = SESSION.api.get_clock()
             # Halt until next open time if available
-            trading_halted_until = clock.next_open if hasattr(clock, "next_open") else now + datetime.timedelta(hours=24)
+            SESSION.trading_halted_until = clock.next_open if hasattr(clock, "next_open") else now + datetime.timedelta(hours=24)
         except Exception:
-            trading_halted_until = now + datetime.timedelta(hours=24)
-        logging.warning(f"Daily loss limit reached (PnL: {daily_realized_pnl:.2f}). Trading halted until {trading_halted_until}.")
+            SESSION.trading_halted_until = now + datetime.timedelta(hours=24)
+        logging.warning(f"Daily loss limit reached (PnL: {SESSION.daily_realized_pnl:.2f}). Trading halted until {SESSION.trading_halted_until}.")
+        return True
+    # Global halt on many consecutive losses
+    if MAX_CONSECUTIVE_LOSSES_HALT and SESSION.consecutive_losses >= MAX_CONSECUTIVE_LOSSES_HALT:
+        if SESSION.api is None:
+            logging.error("Trading client not initialised. Cannot check clock for halt logic.")
+            SESSION.trading_halted_until = datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
+            return True
+        try:
+            clock = SESSION.api.get_clock()
+            SESSION.trading_halted_until = clock.next_open if hasattr(clock, "next_open") else datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
+        except Exception:
+            SESSION.trading_halted_until = datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
+        logging.warning(f"Exceeded max consecutive losses ({SESSION.consecutive_losses}). Trading halted until {SESSION.trading_halted_until}.")
         return True
     return False
 
 
 def _register_trade_outcome(ticker: str, pnl: float):
     """Update loss streaks and potential halts based on trade P&L."""
-    global consecutive_losses, trading_halted_until
     # Global loss streak
     if pnl < 0:
-        consecutive_losses += 1
+        SESSION.consecutive_losses += 1
     else:
-        consecutive_losses = 0
+        SESSION.consecutive_losses = 0
     # Per ticker loss streak & cooldown
-    if ticker not in per_ticker_loss_streak:
-        per_ticker_loss_streak[ticker] = 0
+    if ticker not in SESSION.per_ticker_loss_streak:
+        SESSION.per_ticker_loss_streak[ticker] = 0
     if pnl < 0:
-        per_ticker_loss_streak[ticker] += 1
-        if per_ticker_loss_streak[ticker] >= PER_TICKER_MAX_LOSS_STREAK:
-            per_ticker_cooloff_until[ticker] = datetime.datetime.now(ny_tz) + datetime.timedelta(minutes=PER_TICKER_COOLDOWN_MIN)
+        SESSION.per_ticker_loss_streak[ticker] += 1
+        if SESSION.per_ticker_loss_streak[ticker] >= PER_TICKER_MAX_LOSS_STREAK:
+            SESSION.per_ticker_cooloff_until[ticker] = datetime.datetime.now(ny_tz) + datetime.timedelta(minutes=PER_TICKER_COOLDOWN_MIN)
             logging.warning(f"Cooling off {ticker} for {PER_TICKER_COOLDOWN_MIN} minutes due to loss streak.")
     else:
-        per_ticker_loss_streak[ticker] = 0
+        SESSION.per_ticker_loss_streak[ticker] = 0
     # Global halt on many consecutive losses
-    if MAX_CONSECUTIVE_LOSSES_HALT and consecutive_losses >= MAX_CONSECUTIVE_LOSSES_HALT:
+    if MAX_CONSECUTIVE_LOSSES_HALT and SESSION.consecutive_losses >= MAX_CONSECUTIVE_LOSSES_HALT:
+        if SESSION.api is None:
+            logging.error("Trading client not initialised. Cannot check clock for halt logic.")
+            SESSION.trading_halted_until = datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
+            return
         try:
-            clock = api.get_clock()
-            trading_halted_until = clock.next_open if hasattr(clock, "next_open") else datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
+            clock = SESSION.api.get_clock()
+            SESSION.trading_halted_until = clock.next_open if hasattr(clock, "next_open") else datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
         except Exception:
-            trading_halted_until = datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
-        logging.warning(f"Exceeded max consecutive losses ({consecutive_losses}). Trading halted until {trading_halted_until}.")
+            SESSION.trading_halted_until = datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
+        logging.warning(f"Exceeded max consecutive losses ({SESSION.consecutive_losses}). Trading halted until {SESSION.trading_halted_until}.")
 
 def get_last_trade_price(symbol):
     global data_client
@@ -307,16 +362,16 @@ strategy = Strategy(RSI_PERIOD, 14)
 
 # --- Utility Functions ---
 def is_market_open(ticker=None):
-    if api is None:
+    if SESSION.api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return False
-    clock = api.get_clock()
+    clock = SESSION.api.get_clock()
     if not clock.is_open:
         return False
 
     if ticker:
         try:
-            asset = api.get_asset(ticker)
+            asset = SESSION.api.get_asset(ticker)
             if not asset.tradable:
                 logging.warning(f"{ticker} is not tradable.")
                 return False
@@ -327,23 +382,27 @@ def is_market_open(ticker=None):
     return True
 
 def get_account():
-    if api is None:
+    api_instance = SESSION.api
+    if api_instance is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return None
-    return api.get_account()
+    return api_instance.get_account()
 
 def get_equity():
     account = get_account()
     if account is None:
         return 0.0
-    return float(account.equity)
+    try:
+        return float(account.equity)
+    except Exception:
+        return 0.0
 
 def get_position(symbol):
-    if api is None:
+    if SESSION.api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return 0, 0
     try:
-        pos = api.get_open_position(symbol)
+        pos = SESSION.api.get_open_position(symbol)
         return float(pos.qty), float(pos.avg_entry_price)
     except Exception:
         return 0, 0
@@ -376,8 +435,7 @@ class MarketDataError(Exception):
     pass
 
 def place_order(symbol, qty, side):
-    global realized_pnl
-    if api is None:
+    if SESSION.api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return False
     try:
@@ -413,9 +471,9 @@ def place_order(symbol, qty, side):
                 time_in_force=TimeInForce.GTC,
             )
 
-        api.submit_order(order)
+        SESSION.api.submit_order(order)
         logging.info(f"Order {side.upper()} {symbol} @ {datetime.datetime.now(ny_tz)} with quantity {qty}")
-        last_trade_time[symbol] = datetime.datetime.now(ny_tz)
+        SESSION.last_trade_time[symbol] = datetime.datetime.now(ny_tz)
 
         # --- Supabase log order submitted (schema-safe) ---
         supabase_log(
@@ -423,12 +481,12 @@ def place_order(symbol, qty, side):
         )
 
         if side.lower() == 'sell':
-            trade_history[symbol] = trade_history.get(symbol, {})
-            trade_history[symbol]['last_sell'] = datetime.datetime.now(ny_tz)
+            SESSION.trade_history[symbol] = SESSION.trade_history.get(symbol, {})
+            SESSION.trade_history[symbol]['last_sell'] = datetime.datetime.now(ny_tz)
             # realized PnL is handled on close via close_position()
         else:
-            trade_history[symbol] = trade_history.get(symbol, {})
-            trade_history[symbol]['last_buy'] = datetime.datetime.now(ny_tz)
+            SESSION.trade_history[symbol] = SESSION.trade_history.get(symbol, {})
+            SESSION.trade_history[symbol]['last_buy'] = datetime.datetime.now(ny_tz)
         return True
 
     except APIError as e:
@@ -441,8 +499,7 @@ def place_order(symbol, qty, side):
     return False
 
 def close_position(symbol):
-    global realized_pnl, daily_realized_pnl
-    if api is None:
+    if SESSION.api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return None
     try:
@@ -450,25 +507,25 @@ def close_position(symbol):
         pos_qty, entry_price = get_position(symbol)
         current_price = get_last_trade_price(symbol)
         if pos_qty <= 0 or current_price is None or entry_price <= 0:
-            api.close_position(symbol)
+            SESSION.api.close_position(symbol)
             logging.info(f"Closed position on {symbol}")
-            last_trade_time[symbol] = datetime.datetime.now(ny_tz)
+            SESSION.last_trade_time[symbol] = datetime.datetime.now(ny_tz)
             # --- Supabase log position closed (PnL unknown) ---
             supabase_log(
                 f"position_closed | {symbol} | pnl=unknown @ {datetime.datetime.now(ny_tz).isoformat()}"
             )
             return 0.0
         pnl = (current_price - entry_price) * pos_qty
-        api.close_position(symbol)
+        SESSION.api.close_position(symbol)
         logging.info(f"Closed position on {symbol} @ {datetime.datetime.now(ny_tz)} | qty={pos_qty:.4f} entry={entry_price:.4f} exit={current_price:.4f} pnl={pnl:.2f}")
-        last_trade_time[symbol] = datetime.datetime.now(ny_tz)
-        realized_pnl += pnl
-        daily_realized_pnl += pnl
+        SESSION.last_trade_time[symbol] = datetime.datetime.now(ny_tz)
+        SESSION.realized_pnl += pnl
+        SESSION.daily_realized_pnl += pnl
         # Mark loss timing for re-entry logic
-        trade_history[symbol] = trade_history.get(symbol, {})
+        SESSION.trade_history[symbol] = SESSION.trade_history.get(symbol, {})
         if pnl < 0:
-            trade_history[symbol]['last_loss'] = datetime.datetime.now(ny_tz)
-        trade_history[symbol]['last_sell'] = datetime.datetime.now(ny_tz)
+            SESSION.trade_history[symbol]['last_loss'] = datetime.datetime.now(ny_tz)
+        SESSION.trade_history[symbol]['last_sell'] = datetime.datetime.now(ny_tz)
         # Register outcome for streaks/halts
         _register_trade_outcome(symbol, pnl)
         # --- Supabase log position closed ---
@@ -481,13 +538,12 @@ def close_position(symbol):
         return None
 
 def update_pnl():
-    global realized_pnl, unrealized_pnl
-    if api is None:
+    if SESSION.api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return
-    unrealized_pnl = 0.0
+    SESSION.unrealized_pnl = 0.0
     try:
-        positions = api.get_all_positions()
+        positions = SESSION.api.get_all_positions()
     except Exception as e:
         logging.error(f"Could not fetch positions for P&L update: {e}")
         return
@@ -498,13 +554,13 @@ def update_pnl():
             entry_price = float(position.avg_entry_price)
             current_price = get_last_trade_price(symbol)
             if pos_qty > 0 and current_price is not None and entry_price > 0:
-                unrealized_pnl += (current_price - entry_price) * pos_qty
+                SESSION.unrealized_pnl += (current_price - entry_price) * pos_qty
         except Exception as e:
             logging.error(f"P&L calc error for {position.symbol}: {e}")
-    logging.info(f"Realized P&L: ${realized_pnl:.2f}, Unrealized P&L: ${unrealized_pnl:.2f}")
+    logging.info(f"Realized P&L: ${SESSION.realized_pnl:.2f}, Unrealized P&L: ${SESSION.unrealized_pnl:.2f}")
     # Optional: lightweight log line into bot_logs (does not assume bot_status schema)
     supabase_log(
-        f"pnl_update | realized={realized_pnl:.2f} unrealized={unrealized_pnl:.2f} equity={get_equity():.2f}"
+        f"pnl_update | realized={SESSION.realized_pnl:.2f} unrealized={SESSION.unrealized_pnl:.2f} equity={get_equity():.2f}"
     )
 
 # Patch 2.1: Add async wrapper for P&L update
@@ -664,15 +720,9 @@ def update_trailing_stop(entry_price, current_price, trail_amount, previous_stop
     new_stop = max(previous_stop, current_price - trail_amount)
     return new_stop
 
-# Heartbeat monitoring
-heartbeat_active = True
-# Global run-state flag controlled by the server (start/stop endpoints)
-bot_running = True
 
-def heartbeat_monitor():
-    while heartbeat_active and bot_running:
-        logging.info("Heartbeat: Bot is running.")
-        time.sleep(300)  # Log every 5 minutes
+# Global run-state is now controlled by the worker via task cancellation.
+# The trading loop itself does not manage process lifetime.
 
 
 
@@ -690,32 +740,28 @@ async def safe_api_call(api_function, *args, **kwargs):
     return None
 
 async def close_all_positions():
-    if api is None:
+    if SESSION.api is None:
         logging.error("Trading client not initialised. Cannot proceed.")
         return
     try:
-        positions = await asyncio.to_thread(api.get_all_positions)
+        positions = await asyncio.to_thread(SESSION.api.get_all_positions)
         for position in positions:
             symbol = position.symbol
             logging.info(f"Closing position for {symbol}.")
-            await safe_api_call(api.close_position, symbol)
+            await safe_api_call(SESSION.api.close_position, symbol)
     except Exception as e:
         logging.error(f"Failed to close all positions: {e}")
 
 
-# Helper so the server can request a graceful stop without killing the whole process
+# Helper so the server can request a graceful stop; the worker will cancel the task.
 def request_bot_stop():
-    global bot_running, heartbeat_active
-    bot_running = False
-    heartbeat_active = False
     # --- Supabase log bot stop requested ---
     supabase_log(f"bot_stop_requested @ {datetime.datetime.now(ny_tz).isoformat()}")
-    logging.info("Bot stop requested (bot_running=False). Trading loop will exit gracefully.")
+    logging.info("Bot stop requested; worker will cancel trade_loop_async task.")
 
 async def trade_loop_async():
-    global consecutive_losses, TICKERS, bot_running
     # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
-    while bot_running:
+    while True:
         if not await is_market_open_async():
             logging.info("Market is currently closed. Waiting for market to open before fetching tickers...")
             await asyncio.sleep(300)
@@ -725,10 +771,7 @@ async def trade_loop_async():
         retry_delay = 60  # seconds
 
         for attempt in range(1, max_attempts + 1):
-            if not bot_running:
-                logging.info("Bot stop requested while waiting for AI ticker selector. Exiting trade_loop_async.")
-                return
-            selected_tickers = get_top_tickers()
+            selected_tickers = await asyncio.to_thread(get_top_tickers, 5)
             if selected_tickers:
                 logging.info(f"Top tickers received: {selected_tickers}")
                 break
@@ -739,17 +782,13 @@ async def trade_loop_async():
             logging.error("AI Ticker Selector failed to return tickers after multiple attempts. Exiting trading loop.")
             continue  # try again on next cycle
 
-        TICKERS = selected_tickers
-        if TICKERS:
+        SESSION.TICKERS = selected_tickers
+        if SESSION.TICKERS:
             break
 
-    if not bot_running:
-        logging.info("Bot stop requested before trading loop start. Exiting trade_loop_async.")
-        return
-
-    logging.info(f"Selected tickers for trading: {TICKERS}")
+    logging.info(f"Selected tickers for trading: {SESSION.TICKERS}")
     last_ticker_refresh = ny_now()
-    while bot_running:
+    while True:
         try:
             # Step 3: daily resets & halts
             reset_daily_limits_if_new_day()
@@ -762,8 +801,8 @@ async def trade_loop_async():
             # Refresh tickers every hour
             now = ny_now()
             if (now - last_ticker_refresh).total_seconds() > 3600:
-                TICKERS = await asyncio.to_thread(get_top_tickers, 5)
-                logging.info(f"Selected tickers for trading: {TICKERS}")
+                SESSION.TICKERS = await asyncio.to_thread(get_top_tickers, 5)
+                logging.info(f"Selected tickers for trading: {SESSION.TICKERS}")
                 last_ticker_refresh = now
 
             if not await is_market_open_async():
@@ -772,7 +811,7 @@ async def trade_loop_async():
                 continue
 
             # Check if market is about to close (non-blocking API call)
-            clock = await safe_api_call(api.get_clock)
+            clock = await safe_api_call(SESSION.api.get_clock)
             if clock and hasattr(clock, "next_close") and hasattr(clock, "timestamp"):
                 # Some Alpaca clock objects use .timestamp, others may expose .next_close differently
                 try:
@@ -791,14 +830,14 @@ async def trade_loop_async():
 
             # Intelligent ticker rotation: close positions no longer in top tickers if profitable
             try:
-                positions = await asyncio.to_thread(api.get_all_positions)
+                positions = await asyncio.to_thread(SESSION.api.get_all_positions)
             except Exception as e:
                 logging.error(f"Failed to fetch positions for rotation logic: {e}")
                 positions = []
 
             for position in positions:
                 symbol = position.symbol
-                if symbol not in TICKERS:
+                if symbol not in SESSION.TICKERS:
                     try:
                         unrealized = float(position.unrealized_plpc)
                     except Exception:
@@ -810,20 +849,20 @@ async def trade_loop_async():
             hour_start = ny_now()
 
             tasks = []
-            for ticker in TICKERS:
+            for ticker in SESSION.TICKERS:
                 if not await is_market_open_async(ticker):
                     continue
 
                 now = ny_now()
-                if ticker in last_trade_time and (now - last_trade_time[ticker]).total_seconds() < TRADE_SPACING_SECONDS:
+                if ticker in SESSION.last_trade_time and (now - SESSION.last_trade_time[ticker]).total_seconds() < TRADE_SPACING_SECONDS:
                     continue  # honor trade spacing
 
-                if ticker in recently_traded and (now - recently_traded[ticker]).total_seconds() < REENTRY_COOLDOWN:
+                if ticker in SESSION.recently_traded and (now - SESSION.recently_traded[ticker]).total_seconds() < REENTRY_COOLDOWN:
                     logging.info(f"Skipping {ticker} due to re-entry cooldown.")
                     continue
 
                 # Per-ticker cooldown after loss streak
-                cooloff_until = per_ticker_cooloff_until.get(ticker)
+                cooloff_until = SESSION.per_ticker_cooloff_until.get(ticker)
                 if cooloff_until and ny_now() < cooloff_until:
                     logging.info(f"{ticker} cooling off until {cooloff_until}.")
                     continue
@@ -832,10 +871,10 @@ async def trade_loop_async():
 
             await asyncio.gather(*tasks)
 
-            if consecutive_losses >= 3:
+            if SESSION.consecutive_losses >= 3:
                 logging.warning(f"Cooldown triggered due to 3 losses. Waiting {LOSS_COOLDOWN} seconds...")
                 await asyncio.sleep(LOSS_COOLDOWN)
-                consecutive_losses = 0
+                SESSION.consecutive_losses = 0
 
             if (ny_now() - hour_start).total_seconds() < 60:
                 await asyncio.sleep(30)
@@ -849,7 +888,7 @@ async def trade_loop_async():
         except Exception as e:
             logging.critical(f"Critical error in trade_loop: {e}")
             await asyncio.sleep(300)  # Wait before retrying
-    logging.info("trade_loop_async has exited because bot_running was set to False.")
+    logging.info("trade_loop_async has exited.")
 
 # Process a single ticker asynchronously
 async def process_ticker(ticker):
@@ -882,7 +921,7 @@ async def process_ticker(ticker):
 
         # Cooldowns after recent actions
         now = ny_now()
-        last_sell_time = trade_history.get(ticker, {}).get("last_sell")
+        last_sell_time = SESSION.trade_history.get(ticker, {}).get("last_sell")
         if not have_position and last_sell_time:
             elapsed = (now - last_sell_time).total_seconds()
             # 1h after profit / 2h after loss handled elsewhere, but keep a basic 5-min safety here too
@@ -909,9 +948,9 @@ async def process_ticker(ticker):
                 return
             # Dynamic trailing stop
             trail_amount = atr * STOP_LOSS_ATR_MULT
-            prev_stop = recently_traded.get(f"{ticker}_stop", entry_price - trail_amount)
+            prev_stop = SESSION.recently_traded.get(f"{ticker}_stop", entry_price - trail_amount)
             new_stop = update_trailing_stop(entry_price, close_price, trail_amount, prev_stop)
-            recently_traded[f"{ticker}_stop"] = new_stop
+            SESSION.recently_traded[f"{ticker}_stop"] = new_stop
 
             # Take-profit level (ATR multiple)
             tp = entry_price + (TAKE_PROFIT_ATR_MULT * atr)
@@ -921,9 +960,9 @@ async def process_ticker(ticker):
                 pnl = close_position(ticker)
                 if should_halt_trading():
                     return
-                recently_traded[ticker] = ny_now()
-                trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_sell'] = ny_now()
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
+                SESSION.trade_history[ticker]['last_sell'] = ny_now()
                 logging.info(f"Trailing stop triggered for {ticker} at {new_stop:.2f}")
                 return
 
@@ -932,9 +971,9 @@ async def process_ticker(ticker):
                 pnl = close_position(ticker)
                 if should_halt_trading():
                     return
-                recently_traded[ticker] = ny_now()
-                trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_sell'] = ny_now()
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
+                SESSION.trade_history[ticker]['last_sell'] = ny_now()
                 logging.info(f"Take-profit exit for {ticker} at {close_price:.2f}")
                 return
 
@@ -943,9 +982,9 @@ async def process_ticker(ticker):
                 pnl = close_position(ticker)
                 if should_halt_trading():
                     return
-                recently_traded[ticker] = ny_now()
-                trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_sell'] = ny_now()
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
+                SESSION.trade_history[ticker]['last_sell'] = ny_now()
                 logging.info(f"Signal-based exit for {ticker} at {close_price:.2f} (score {score:.3f})")
             return
 
@@ -966,13 +1005,13 @@ async def process_ticker(ticker):
                 return
             logging.info(f"ENTRY {ticker}: px={close_price:.2f}, qty={qty}, score={score:.3f}, rsi={rsi:.1f}, atr%={atr_pct:.3%}")
             if await place_order_async(ticker, qty, 'buy'):
-                recently_traded[ticker] = ny_now()
+                SESSION.recently_traded[ticker] = ny_now()
                 # initialize trailing stop
-                recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)
-                trade_history[ticker] = trade_history.get(ticker, {})
-                trade_history[ticker]['last_buy'] = ny_now()
-                trade_history[ticker]['last_signal_score'] = float(score)
-                last_trade_time[ticker] = ny_now()
+                SESSION.recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)
+                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
+                SESSION.trade_history[ticker]['last_buy'] = ny_now()
+                SESSION.trade_history[ticker]['last_signal_score'] = float(score)
+                SESSION.last_trade_time[ticker] = ny_now()
 
     except Exception as e:
         logging.error(f"Error processing {ticker}: {e}")

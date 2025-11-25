@@ -169,6 +169,64 @@ async def log_activity(user_id: str, mode: str, message: str) -> None:
         )
 
 
+async def mark_bot_status(user_id: str, mode: str, fields: Dict[str, Any]) -> None:
+    """
+    Helper to update bot_status for a given user+mode.
+    This is best-effort only – failures are logged but do not crash the worker.
+    """
+    def _update():
+        payload = {
+            **fields,
+            "updated_at": "now()",
+        }
+        return (
+            supabase.table("bot_status")
+            .update(payload)
+            .eq("user_id", user_id)
+            .eq("mode", mode)
+            .execute()
+        )
+
+    try:
+        await _run_supabase(_update)
+    except Exception:
+        logger.exception(
+            "Failed to update bot_status for user_id=%s mode=%s with %s",
+            user_id,
+            mode,
+            fields,
+        )
+
+
+async def mark_bot_running(user_id: str, mode: str) -> None:
+    """
+    Mark bot as running and clear any unexpected shutdown flag.
+    """
+    await mark_bot_status(
+        user_id,
+        mode,
+        {
+            "running": True,
+            "unexpected_shutdown": False,
+            "stop_time": None,
+            "error": None,
+        },
+    )
+
+
+async def mark_bot_stopped(user_id: str, mode: str, *, unexpected: bool) -> None:
+    """
+    Mark bot as stopped. If unexpected=True, set unexpected_shutdown for UI.
+    """
+    fields: Dict[str, Any] = {
+        "running": False,
+        "stop_time": "now()",
+    }
+    if unexpected:
+        fields["unexpected_shutdown"] = True
+    await mark_bot_status(user_id, mode, fields)
+
+
 # ----------------------------------------
 # Crypto helper
 # ----------------------------------------
@@ -246,6 +304,8 @@ async def worker_loop(poll_interval: int = 10) -> None:
 
             # Clear last_error on successful startup
             await clear_bot_error(user_id, mode)
+            # Mark status as running for this user+mode
+            await mark_bot_running(user_id, mode)
 
             await log_activity(user_id, mode, f"Bot starting (strategy={strategy_id})")
 
@@ -265,6 +325,8 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     strategy_id=strategy_id,
                 )
                 await log_activity(user_id, mode, "trade_loop_async finished normally")
+                # Mark bot as stopped gracefully
+                await mark_bot_stopped(user_id, mode, unexpected=False)
                 # If trade_loop_async returns normally, we just log and the worker
                 # will decide whether to restart it on the next poll, depending on is_running.
                 logger.info(
@@ -275,6 +337,8 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 )
             except asyncio.CancelledError:
                 await log_activity(user_id, mode, "Bot task cancelled")
+                # Mark as stopped but not unexpected – user likely toggled is_running off
+                await mark_bot_stopped(user_id, mode, unexpected=False)
                 logger.info("⏹ Bot task cancelled for %s", task_key)
                 raise
             except Exception as e:
@@ -288,22 +352,14 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 )
                 await update_bot_error(user_id, mode, f"Bot crashed: {e!r}")
                 # Mark unexpected shutdown for UI indicator
-                def _mark_unexpected():
-                    return (
-                        supabase.table("bot_status")
-                        .update({
-                            "unexpected_shutdown": True,
-                            "stop_time": "now()",
-                            "updated_at": "now()"
-                        })
-                        .eq("user_id", user_id)
-                        .eq("mode", mode)
-                        .execute()
-                    )
                 try:
-                    await _run_supabase(_mark_unexpected)
+                    await mark_bot_stopped(user_id, mode, unexpected=True)
                 except Exception:
-                    logger.exception("Failed to mark unexpected shutdown for user_id=%s mode=%s", user_id, mode)
+                    logger.exception(
+                        "Failed to mark unexpected shutdown for user_id=%s mode=%s",
+                        user_id,
+                        mode,
+                    )
 
         # Create and track the new task
         bot_tasks[task_key] = asyncio.create_task(run_bot_task())

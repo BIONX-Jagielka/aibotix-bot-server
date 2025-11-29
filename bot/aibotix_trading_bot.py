@@ -22,6 +22,7 @@ class BotSession:
         self.per_ticker_cooloff_until = {}
         self.recently_traded = {}
         self.trade_history = {}
+        self.ACTIVE_TICKERS = []
 
 # Multi-user session registry: one BotSession per (user_id, mode)
 SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
@@ -572,7 +573,7 @@ def calculate_position_size(symbol, risk_per_trade):
     equity = get_equity()
     # Use only equity after reserving safety buffer
     usable_equity = max(equity * (1 - RESERVE_FUND_PCT), 0)
-    max_risk = max(usable_equity * risk_per_trade, MIN_DOLLARS_PER_TRADE * 0.01)  # ensure non-zero
+    max_risk = max(usable_equity * risk_per_trade, 0.01)  # ensure a tiny non-zero risk budget
 
     df = fetch_data(symbol)
     if df is None or df.empty:
@@ -599,10 +600,6 @@ def calculate_position_size(symbol, risk_per_trade):
         raw_qty = min(raw_qty, max_dollars / current_price)
 
     # Also make sure we meet min dollars per trade if we do trade
-    dollars = raw_qty * current_price
-    if dollars < MIN_DOLLARS_PER_TRADE:
-        return 0.0
-
     return round(float(raw_qty), 4)
 
 def fetch_data(symbol):
@@ -691,7 +688,7 @@ MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
 MIN_BARS_REQUIRED = max(RSI_PERIOD + 5, 50)  # ensure enough data for indicators
 
 # Position sizing caps
-MIN_DOLLARS_PER_TRADE = 25.0
+MIN_DOLLARS_PER_TRADE = 0.0  # We allow very small fractional trades
 MAX_EQUITY_FRACTION_PER_TICKER = MAX_TICKER_EXPOSURE  # reuse your 30% cap
 
 # Calculate weighted signal score
@@ -759,7 +756,12 @@ def request_bot_stop():
     supabase_log(f"bot_stop_requested @ {datetime.datetime.now(ny_tz).isoformat()}")
     logging.info("Bot stop requested; worker will cancel trade_loop_async task.")
 
-async def trade_loop_async():
+async def trade_loop_async(allowed_tickers=None):
+    # Ensure correct session context
+    get_session(SESSION.USER_ID, SESSION.CURRENT_MODE)
+    if allowed_tickers is not None:
+        # Override AI-selected tickers
+        SESSION.TICKERS = list(allowed_tickers)
     # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
     while True:
         if not await is_market_open_async():
@@ -771,7 +773,15 @@ async def trade_loop_async():
         retry_delay = 60  # seconds
 
         for attempt in range(1, max_attempts + 1):
-            selected_tickers = await asyncio.to_thread(get_top_tickers, 5)
+            if allowed_tickers is not None:
+                selected_tickers = list(allowed_tickers)
+            else:
+                selected_tickers = await asyncio.to_thread(
+                    get_top_tickers,
+                    5,
+                    SESSION.USER_ID,
+                    SESSION.CURRENT_MODE
+                )
             if selected_tickers:
                 logging.info(f"Top tickers received: {selected_tickers}")
                 break
@@ -798,12 +808,120 @@ async def trade_loop_async():
                 continue
 
             logging.info("Bot is evaluating trade opportunities...")
-            # Refresh tickers every hour
+            # === Intelligent 30-Minute AI Ticker Refresh ===
             now = ny_now()
-            if (now - last_ticker_refresh).total_seconds() > 3600:
-                SESSION.TICKERS = await asyncio.to_thread(get_top_tickers, 5)
-                logging.info(f"Selected tickers for trading: {SESSION.TICKERS}")
-                last_ticker_refresh = now
+            if allowed_tickers is None and (now - last_ticker_refresh).total_seconds() > 1800:  # 30 minutes
+                logging.info("Running 30-minute AI ticker refresh...")
+
+                # Fetch new AI tickers
+                new_ai_tickers = await asyncio.to_thread(
+                    get_top_tickers,
+                    5,
+                    SESSION.USER_ID,
+                    SESSION.CURRENT_MODE
+                )
+
+                if not new_ai_tickers:
+                    logging.warning("AI Ticker Selector returned no tickers. Keeping existing set.")
+                    last_ticker_refresh = now
+                else:
+                    # Fetch open positions
+                    try:
+                        positions = await asyncio.to_thread(SESSION.api.get_all_positions)
+                    except Exception as e:
+                        logging.error(f"Failed to fetch positions for refresh comparison: {e}")
+                        positions = []
+
+                    open_positions = {}
+                    for p in positions:
+                        try:
+                            open_positions[p.symbol] = float(p.unrealized_pl)
+                        except Exception:
+                            open_positions[p.symbol] = 0.0
+
+                    # --- CONSERVATIVE AI ROTATION LOGIC (Step 1) ---
+                    active = []
+
+                    # Re-score existing open positions
+                    re_scored_current = {}
+                    for p in positions:
+                        sym = p.symbol
+                        df_cur = await fetch_data_async(sym)
+                        if df_cur is None or len(df_cur) < MIN_BARS_REQUIRED:
+                            continue
+                        cur_rsi = float(df_cur['RSI'].iloc[-1])
+                        cur_atr = float(df_cur['ATR_PCT'].iloc[-1])
+                        cur_macd = float(df_cur['MACD'].iloc[-1])
+                        cur_close = float(df_cur['close'].iloc[-1])
+                        cur_bb_u = float(df_cur['BB_upper'].iloc[-1])
+                        cur_bb_l = float(df_cur['BB_lower'].iloc[-1])
+                        cur_sent = await get_sentiment_score(sym)
+                        score_cur = calculate_signal_score(
+                            rsi=cur_rsi, atr=cur_atr, sentiment=cur_sent,
+                            macd=cur_macd, close_price=cur_close,
+                            bb_upper=cur_bb_u, bb_lower=cur_bb_l
+                        )
+                        if score_cur is not None:
+                            re_scored_current[sym] = score_cur
+
+                    # Decide which current tickers remain
+                    for sym, pnl in open_positions.items():
+                        score_cur = re_scored_current.get(sym, -1)
+                        if pnl >= 0 and score_cur >= SIGNAL_BUY_THRESHOLD * 0.7:
+                            logging.info(f"Keeping strong existing ticker {sym} | score={score_cur:.3f}")
+                            active.append(sym)
+                        elif pnl >= 0 and sym in new_ai_tickers:
+                            logging.info(f"Keeping current ticker {sym} as AI still lists it.")
+                            active.append(sym)
+                        else:
+                            if pnl < 0:
+                                logging.info(f"Closing weakened ticker {sym} due to underperformance.")
+                                await asyncio.to_thread(close_position, sym)
+
+                    # Fill remaining slots only with significantly stronger new tickers
+                    for candidate in new_ai_tickers:
+                        if candidate not in active:
+                            # Check candidate score
+                            df_c = await fetch_data_async(candidate)
+                            if df_c is None or len(df_c) < MIN_BARS_REQUIRED:
+                                continue
+                            c_rsi = float(df_c['RSI'].iloc[-1])
+                            c_atr = float(df_c['ATR_PCT'].iloc[-1])
+                            c_macd = float(df_c['MACD'].iloc[-1])
+                            c_close = float(df_c['close'].iloc[-1])
+                            c_bb_u = float(df_c['BB_upper'].iloc[-1])
+                            c_bb_l = float(df_c['BB_lower'].iloc[-1])
+                            c_sent = await get_sentiment_score(candidate)
+                            score_c = calculate_signal_score(
+                                rsi=c_rsi, atr=c_atr, sentiment=c_sent,
+                                macd=c_macd, close_price=c_close,
+                                bb_upper=c_bb_u, bb_lower=c_bb_l
+                            )
+                            if score_c is None:
+                                continue
+
+                            # Check if candidate is clearly stronger than weakest current
+                            if len(active) < 5:
+                                active.append(candidate)
+                            else:
+                                weakest_sym = None
+                                weakest_score = float('inf')
+                                for sym in active:
+                                    sc = re_scored_current.get(sym, -1)
+                                    if sc < weakest_score:
+                                        weakest_score = sc
+                                        weakest_sym = sym
+
+                                if score_c > weakest_score * 1.25:  # must be significantly stronger
+                                    active.remove(weakest_sym)
+                                    active.append(candidate)
+
+                    # Final conservative updated set
+                    SESSION.ACTIVE_TICKERS = active
+                    SESSION.TICKERS = active
+                    logging.info(f"Updated ACTIVE_TICKERS (conservative mode): {SESSION.ACTIVE_TICKERS}")
+
+                    last_ticker_refresh = now
 
             if not await is_market_open_async():
                 logging.info("Market closed. Sleeping 5 mins...")
@@ -848,8 +966,13 @@ async def trade_loop_async():
 
             hour_start = ny_now()
 
+            if not SESSION.TICKERS:
+                logging.warning("SESSION.TICKERS empty. Waiting 60s...")
+                await asyncio.sleep(60)
+                continue
+
             tasks = []
-            for ticker in SESSION.TICKERS:
+            for ticker in SESSION.ACTIVE_TICKERS:
                 if not await is_market_open_async(ticker):
                     continue
 
@@ -941,77 +1064,137 @@ async def process_ticker(ticker):
         if score is None:
             return
 
-        # ================ EXIT LOGIC (if holding) ================
+        # ================ SMART EXIT LOGIC (if holding) ================
+        # ---- Simplified Unified SMART EXIT LOGIC ----
         if have_position:
-            if BRACKET_ORDERS_ENABLED:
-                # Let server-side OCO (TP/SL) manage exits; skip local exit logic
+            # Calculate current PnL
+            pnl_pct = 0.0
+            if entry_price > 0:
+                pnl_pct = (close_price - entry_price) / entry_price
+
+            # Track peak for reversal detection
+            peak_key = f"{ticker}_peak_pnl"
+            prev_peak = SESSION.recently_traded.get(peak_key, 0.0)
+            new_peak = max(prev_peak, pnl_pct)
+            SESSION.recently_traded[peak_key] = new_peak
+
+            # Thresholds
+            MIN_LOCK_PROFIT = 0.001   # 0.1%
+            REVERSAL_DROP   = 0.001   # 0.1%
+            BASE_TP         = 0.03    # 3%
+            EXT_TP          = 0.05    # 5%
+
+            # 1. Exit if losing and score turns bad
+            if pnl_pct <= 0 and score <= SIGNAL_SELL_THRESHOLD:
+                pnl = close_position(ticker)
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                logging.info(f"[EXIT] Defensive loss exit {ticker} | pnl={pnl_pct:.2%}")
                 return
-            # Dynamic trailing stop
+
+            # 2. Reversal exit protecting >0.1% profits
+            if pnl_pct >= MIN_LOCK_PROFIT and (new_peak - pnl_pct) >= REVERSAL_DROP:
+                pnl = close_position(ticker)
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                logging.info(f"[EXIT] Reversal exit {ticker} | pnl={pnl_pct:.2%}, peak={new_peak:.2%}")
+                return
+
+            # 3. Standard 3% take-profit unless momentum strong
+            if BASE_TP <= pnl_pct < EXT_TP:
+                momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 70)
+                if momentum_weak:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    logging.info(f"[EXIT] Base 3% TP exit {ticker} | pnl={pnl_pct:.2%}")
+                    return
+
+            # 4. High-profit exit above 5% if momentum weakens
+            if pnl_pct >= EXT_TP:
+                momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 72)
+                if momentum_weak:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    logging.info(f"[EXIT] High-profit exit {ticker} | pnl={pnl_pct:.2%}")
+                    return
+
+            # 5. Fallback trailing stop
             trail_amount = atr * STOP_LOSS_ATR_MULT
             prev_stop = SESSION.recently_traded.get(f"{ticker}_stop", entry_price - trail_amount)
             new_stop = update_trailing_stop(entry_price, close_price, trail_amount, prev_stop)
             SESSION.recently_traded[f"{ticker}_stop"] = new_stop
 
-            # Take-profit level (ATR multiple)
-            tp = entry_price + (TAKE_PROFIT_ATR_MULT * atr)
-
-            # Hard stop if price pierces trailing stop
             if close_price <= new_stop:
                 pnl = close_position(ticker)
-                if should_halt_trading():
-                    return
                 SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
-                SESSION.trade_history[ticker]['last_sell'] = ny_now()
-                logging.info(f"Trailing stop triggered for {ticker} at {new_stop:.2f}")
+                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                logging.info(f"[EXIT] Trailing stop exit {ticker}")
                 return
 
-            # Profit-taking: price hits TP or RSI gets very overbought
-            if close_price >= tp or (not pd.isna(rsi) and rsi >= 72):
+            # 6. RSI safety exit
+            if not pd.isna(rsi) and rsi >= 75 and pnl_pct > 0:
                 pnl = close_position(ticker)
-                if should_halt_trading():
-                    return
                 SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
-                SESSION.trade_history[ticker]['last_sell'] = ny_now()
-                logging.info(f"Take-profit exit for {ticker} at {close_price:.2f}")
+                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                logging.info(f"[EXIT] RSI overbought safety exit {ticker} | rsi={rsi:.1f}")
                 return
-
-            # Defensive exit if signal flips clearly negative
-            if score <= SIGNAL_SELL_THRESHOLD:
-                pnl = close_position(ticker)
-                if should_halt_trading():
-                    return
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
-                SESSION.trade_history[ticker]['last_sell'] = ny_now()
-                logging.info(f"Signal-based exit for {ticker} at {close_price:.2f} (score {score:.3f})")
-            return
 
         # ================ ENTRY LOGIC (if flat) ================
-        # Quality guard: avoid chasing high RSI on entry
-        if not pd.isna(rsi) and rsi > MAX_RSI_FOR_ENTRY:
+        # Conservative Entry Logic (Step 2)
+
+        # 1. RSI conservative filter (avoid overbought)
+        if not pd.isna(rsi) and rsi > 60:
             return
 
-        # Require sufficient positive score to enter
-        if score >= SIGNAL_BUY_THRESHOLD:
-            if not can_attempt_trade(ticker):
-                logging.info(f"Skipping {ticker}: attempt limit reached for current minute.")
-                return
-            if should_halt_trading():
-                return
-            qty = calculate_position_size(ticker, RISK_PER_TRADE)
-            if qty <= 0:
-                return
-            logging.info(f"ENTRY {ticker}: px={close_price:.2f}, qty={qty}, score={score:.3f}, rsi={rsi:.1f}, atr%={atr_pct:.3%}")
-            if await place_order_async(ticker, qty, 'buy'):
-                SESSION.recently_traded[ticker] = ny_now()
-                # initialize trailing stop
-                SESSION.recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)
-                SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
-                SESSION.trade_history[ticker]['last_buy'] = ny_now()
-                SESSION.trade_history[ticker]['last_signal_score'] = float(score)
-                SESSION.last_trade_time[ticker] = ny_now()
+        # 2. ATR volatility filter (avoid weak or explosive regimes)
+        if pd.isna(atr_pct) or atr_pct < 0.004 or atr_pct > 0.05:
+            return
+
+        # 3. MACD confirmation – must be positive and rising
+        prev_macd = float(df['MACD'].iloc[-2]) if len(df) > 1 else macd
+        if macd <= 0 or macd < prev_macd:
+            return
+
+        # 4. Bollinger Band mid‑band support – avoid chasing upper band
+        if close_price > bb_upper:
+            return
+
+        # 5. Sentiment must be neutral or positive
+        if sentiment < 0:
+            return
+
+        # 6. Score threshold aligned with Smart Exit Logic
+        CONSERVATIVE_ENTRY_THRESHOLD = SIGNAL_BUY_THRESHOLD * 1.15  # slightly stricter than exit threshold
+        if score < CONSERVATIVE_ENTRY_THRESHOLD:
+            return
+
+        # 7. Trend acceleration – confirm short‑term momentum
+        prev_close = float(df['close'].iloc[-2]) if len(df) > 1 else close_price
+        if close_price <= prev_close:
+            return
+
+        # 8. Safety checks before entering
+        if not can_attempt_trade(ticker):
+            logging.info(f"Skipping {ticker}: attempt limit reached for current minute.")
+            return
+        if should_halt_trading():
+            return
+
+        qty = calculate_position_size(ticker, RISK_PER_TRADE)
+        if qty <= 0:
+            return
+
+        logging.info(f"ENTRY {ticker}: conservative | px={close_price:.2f} qty={qty} score={score:.3f} rsi={rsi:.1f} macd rising atr%={atr_pct:.3%}")
+
+        if await place_order_async(ticker, qty, 'buy'):
+            SESSION.recently_traded[ticker] = ny_now()
+            SESSION.recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)
+            SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})
+            SESSION.trade_history[ticker]['last_buy'] = ny_now()
+            SESSION.trade_history[ticker]['last_signal_score'] = float(score)
+            SESSION.last_trade_time[ticker] = ny_now()
 
     except Exception as e:
         logging.error(f"Error processing {ticker}: {e}")

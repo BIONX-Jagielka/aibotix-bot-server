@@ -9,6 +9,17 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+# --- Supabase Client for AI Ticker Persistence ---
+from supabase import create_client, Client
+from typing import List, Dict, Any, Optional
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -161,53 +172,137 @@ async def stage_a_screen_and_collect(limit=5):
     return indicator_results
 
 
+def get_open_position_symbols():
+    """
+    Returns a set of symbols the account is already holding.
+    Prevents the AI selector from opening duplicate positions.
+    """
+    try:
+        data_client, trading_client = init_clients()
+        positions = trading_client.get_all_positions()
+        return {p.symbol for p in positions}
+    except Exception as e:
+        logging.warning(f"Failed to retrieve open positions: {e}")
+        return set()
+
+def unified_ai_score(
+    rsi: float,
+    atr: float,
+    ema_crossover: bool,
+    volume_ratio: float,
+    slope: float,
+    gap: float,
+) -> Optional[float]:
+    """
+    Unified multi-factor score used both for live AI screening and historical CSV-based ranking.
+    This is conceptually aligned with the trading bot's signal logic: prefer healthy RSI,
+    reasonable volatility, positive trend, good volume, and constructive gaps.
+    """
+    # Require RSI
+    if pd.isna(rsi):
+        return None
+
+    # Safe defaults for other indicators
+    if pd.isna(atr) or atr <= 0:
+        atr = 1.0
+    if pd.isna(volume_ratio) or volume_ratio <= 0:
+        volume_ratio = 1.0
+    if pd.isna(slope):
+        slope = 0.0
+    if pd.isna(gap):
+        gap = 0.0
+
+    score = 0.0
+
+    # 1) RSI: prefer 40–60, softly accept 30–70, penalise extremes
+    if 30 <= rsi <= 75:
+        # bell-shaped preference around 50
+        score += max(0.0, 1.5 - abs(rsi - 50) / 15.0)
+    else:
+        score -= 0.5
+
+    # 2) ATR: prefer non-crazy volatility (smaller ATR is safer, but not zero)
+    atr_clamped = min(max(atr, 0.01), 5.0)
+    score += 0.5 / atr_clamped
+
+    # 3) EMA crossover: bullish alignment
+    if ema_crossover:
+        score += 1.0
+
+    # 4) Volume ratio: prefer above-average volume, cap contribution
+    if volume_ratio > 1.0:
+        score += min(1.5, (volume_ratio - 1.0) / 2.0)
+
+    # 5) Slope: upward 5-bar trend is good, cap so a single spike doesn't dominate
+    if slope > 0:
+        score += min(1.5, slope * 100.0)
+
+    # 6) Gap: very large gaps are risky; small gaps can be constructive
+    if abs(gap) > 0.10:
+        score -= 1.0
+    elif abs(gap) > 0.02:
+        score += 0.2
+
+    return score
+
 def score_tickers(indicator_results, top_n=5):
+    """
+    Score tickers using the unified multi-factor model so that
+    live AI screening is aligned with the trading bot's signal logic.
+    """
     scored = []
     for symbol, data in indicator_results:
         rsi = data['rsi']
         atr = data['atr']
-        crossover = data['ema_crossover']
         volume_ratio = data['volume_ratio']
         slope = data['slope']
         gap = data['gap']
+        crossover = data['ema_crossover']
 
-        # Require RSI, but make other indicators robust to NaNs by using safe defaults
-        if pd.isna(rsi):
+        score_val = unified_ai_score(
+            rsi=rsi,
+            atr=atr,
+            ema_crossover=crossover,
+            volume_ratio=volume_ratio,
+            slope=slope,
+            gap=gap,
+        )
+        if score_val is None:
             continue
 
-        # If ATR is missing or zero/negative, treat as neutral (avoid division-by-zero logic elsewhere)
-        if pd.isna(atr) or atr <= 0:
-            atr = 1.0
+        scored.append((symbol, score_val))
 
-        # Treat missing volume_ratio as neutral (1.0 means "normal" volume)
-        if pd.isna(volume_ratio) or volume_ratio <= 0:
-            volume_ratio = 1.0
-
-        # Treat missing slope/gap as flat / no gap
-        if pd.isna(slope):
-            slope = 0.0
-        if pd.isna(gap):
-            gap = 0.0
-
-        score = 0
-        if 40 <= rsi <= 70:
-            score += 1
-        if crossover:
-            score += 1
-        if volume_ratio > 1:
-            score += 1
-        if slope > 0:
-            score += 1
-        if abs(gap) > 0.01:
-            score += 1
-
-        scored.append((symbol, score))
-
+    # Sort by unified AI score (highest first)
     sorted_scored = sorted(scored, key=lambda x: x[1], reverse=True)
+
+    # Apply soft feedback adjustments
     sorted_scored = adjust_scoring_with_feedback(sorted_scored)
-    top_symbols = [s for s, _ in sorted_scored[:top_n]]
-    logging.info(f"Top {top_n} symbols by score: {top_symbols}")
+
+    # Filter out duplicates and open positions
+    open_symbols = get_open_position_symbols()
+    filtered = []
+    seen = set()
+
+    for symbol, score in sorted_scored:
+        if symbol in seen:
+            continue
+        if symbol in open_symbols:
+            logging.info(f"Skipping {symbol} (already an open position).")
+            continue
+
+        seen.add(symbol)
+        filtered.append((symbol, score))
+
+        if len(filtered) >= top_n:
+            break
+
+    top_symbols = [s for s, _ in filtered]
+    logging.info(f"Top {len(top_symbols)} symbols by score (after filtering): {top_symbols}")
     return top_symbols
+
+# NOTE:
+# save_ai_tickers(user_id, mode, top_symbols, {}) 
+# (Call this from worker or main process where user_id/mode context exists)
 
 def log_selected_tickers_for_learning(indicator_results):
     try:
@@ -276,6 +371,40 @@ def record_trade_feedback(symbol, profit, filename="ai_ticker_feedback.csv"):
     except Exception as e:
         logging.warning(f"Failed to record feedback: {e}")
 
+def save_ai_tickers(
+    user_id: str,
+    mode: str,
+    tickers: List[str],
+    scores: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Store AI-selected tickers for user+mode into Supabase ai_tickers table.
+    Overwrites existing entries for that user+mode.
+    """
+    if not supabase:
+        print("[AI-Tickers] Supabase client not configured — cannot save tickers.")
+        return
+
+    payload = {
+        "user_id": user_id,
+        "mode": mode,
+        "tickers": tickers,
+        "score_json": scores or {},
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        (
+            supabase.table("ai_tickers")
+            .upsert(payload, on_conflict="user_id,mode")
+            .execute()
+        )
+        print(
+            f"[AI-Tickers] Saved {len(tickers)} tickers for user_id={user_id} mode={mode}: {tickers}"
+        )
+    except Exception as e:
+        print(f"[AI-Tickers] Failed to save tickers for user_id={user_id} mode={mode}: {e!r}")
+
 if __name__ == "__main__":
     results = asyncio.run(stage_a_screen_and_collect())
     log_selected_tickers_for_learning(results)
@@ -287,10 +416,14 @@ def get_top_tickers(indicator_log_csv='ai_ticker_learning_log.csv', top_n=5):
         df.dropna(subset=['rsi', 'atr'], inplace=True)
 
         def score(row):
-            rsi_score = max(0, 70 - row['rsi']) if row['rsi'] < 70 else 0
-            atr_score = 1 / row['atr'] if row['atr'] > 0 else 0
-            ema_score = 1 if row['ema_crossover'] else 0
-            return rsi_score + atr_score + ema_score
+            return unified_ai_score(
+                rsi=row.get('rsi'),
+                atr=row.get('atr'),
+                ema_crossover=bool(row.get('ema_crossover')),
+                volume_ratio=row.get('volume_ratio', 1.0),
+                slope=row.get('slope', 0.0),
+                gap=row.get('gap', 0.0),
+            ) or 0.0
 
         df['score'] = df.apply(score, axis=1)
         top_df = df.sort_values(by='score', ascending=False).head(top_n)

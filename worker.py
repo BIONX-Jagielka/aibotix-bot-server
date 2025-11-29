@@ -227,6 +227,54 @@ async def mark_bot_stopped(user_id: str, mode: str, *, unexpected: bool) -> None
     await mark_bot_status(user_id, mode, fields)
 
 
+async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
+    """
+    Load AI-approved tickers for this user+mode from ai_tickers table.
+    Returns None if no tickers are configured.
+    """
+    def _query():
+        return (
+            supabase.table("ai_tickers")
+            .select("tickers")
+            .eq("user_id", user_id)
+            .eq("mode", mode)
+            .single()
+            .execute()
+        )
+
+    try:
+        res = await _run_supabase(_query)
+        data = getattr(res, "data", None)
+
+        if not data:
+            logger.info(
+                "No AI tickers configured for user_id=%s mode=%s; bot will stay idle.",
+                user_id,
+                mode,
+            )
+            return None
+
+        tickers = data.get("tickers") or []
+
+        if not tickers:
+            logger.info(
+                "AI tickers row exists but list empty for user_id=%s mode=%s; bot idle.",
+                user_id,
+                mode,
+            )
+            return None
+
+        return tickers
+    except Exception as e:
+        logger.exception(
+            "Failed to fetch AI tickers for user_id=%s mode=%s: %s",
+            user_id,
+            mode,
+            e,
+        )
+        return None
+
+
 # ----------------------------------------
 # Crypto helper
 # ----------------------------------------
@@ -302,6 +350,17 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 await update_bot_error(user_id, mode, msg)
                 return
 
+            # Load AI-approved tickers for this user+mode
+            ai_tickers = await fetch_ai_tickers(user_id, mode)
+
+            if not ai_tickers:
+                msg = "No AI-approved tickers configured; bot cannot start."
+                logger.warning("%s (user_id=%s, mode=%s)", msg, user_id, mode)
+                await update_bot_error(user_id, mode, msg)
+                await mark_bot_stopped(user_id, mode, unexpected=False)
+                await log_activity(user_id, mode, msg)
+                return
+
             # Clear last_error on successful startup
             await clear_bot_error(user_id, mode)
             # Mark status as running for this user+mode
@@ -316,14 +375,18 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     mode,
                     strategy_id,
                 )
+                # Build session object for multi-user isolation
+                session = {
+                    "user_id": user_id,
+                    "mode": mode,
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                    "strategy_id": strategy_id,
+                    "allowed_tickers": ai_tickers,
+                }
+
                 # This call should be a long-lived loop inside the bot.
-                await trade_loop_async(
-                    mode=mode,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    user_id=user_id,
-                    strategy_id=strategy_id,
-                )
+                await trade_loop_async(session=session)
                 await log_activity(user_id, mode, "trade_loop_async finished normally")
                 # Mark bot as stopped gracefully
                 await mark_bot_stopped(user_id, mode, unexpected=False)

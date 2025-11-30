@@ -174,21 +174,23 @@ async def mark_bot_status(user_id: str, mode: str, fields: Dict[str, Any]) -> No
     Helper to update bot_status for a given user+mode.
     This is best-effort only – failures are logged but do not crash the worker.
     """
-    def _update():
+    def _upsert():
         payload = {
             **fields,
             "updated_at": "now()",
         }
         return (
             supabase.table("bot_status")
-            .update(payload)
-            .eq("user_id", user_id)
-            .eq("mode", mode)
+            .upsert({
+                "user_id": user_id,
+                "mode": mode,
+                **payload
+            })
             .execute()
         )
 
     try:
-        await _run_supabase(_update)
+        await _run_supabase(_upsert)
     except Exception:
         logger.exception(
             "Failed to update bot_status for user_id=%s mode=%s with %s",
@@ -202,29 +204,62 @@ async def mark_bot_running(user_id: str, mode: str) -> None:
     """
     Mark bot as running and clear any unexpected shutdown flag.
     """
-    await mark_bot_status(
-        user_id,
-        mode,
-        {
+    def _upsert():
+        payload = {
             "running": True,
             "unexpected_shutdown": False,
             "stop_time": None,
             "error": None,
-        },
-    )
+            "updated_at": "now()",
+        }
+        return (
+            supabase.table("bot_status")
+            .upsert({
+                "user_id": user_id,
+                "mode": mode,
+                **payload
+            })
+            .execute()
+        )
+    try:
+        await _run_supabase(_upsert)
+    except Exception:
+        logger.exception(
+            "Failed to mark bot as running for user_id=%s mode=%s",
+            user_id,
+            mode,
+        )
 
 
 async def mark_bot_stopped(user_id: str, mode: str, *, unexpected: bool) -> None:
     """
     Mark bot as stopped. If unexpected=True, set unexpected_shutdown for UI.
     """
-    fields: Dict[str, Any] = {
+    payload: Dict[str, Any] = {
         "running": False,
         "stop_time": "now()",
+        "updated_at": "now()",
     }
     if unexpected:
-        fields["unexpected_shutdown"] = True
-    await mark_bot_status(user_id, mode, fields)
+        payload["unexpected_shutdown"] = True
+    def _upsert():
+        return (
+            supabase.table("bot_status")
+            .upsert({
+                "user_id": user_id,
+                "mode": mode,
+                **payload
+            })
+            .execute()
+        )
+    try:
+        await _run_supabase(_upsert)
+    except Exception:
+        logger.exception(
+            "Failed to mark bot as stopped for user_id=%s mode=%s",
+            user_id,
+            mode,
+        )
 
 
 async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:

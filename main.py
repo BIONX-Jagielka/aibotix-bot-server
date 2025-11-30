@@ -132,16 +132,51 @@ def read_root():
 
 @app.get("/api/status")
 @app.get("/status")
-async def get_status_alias(user_id: Optional[str] = None):
-    return await get_status(user_id)
+async def get_status_alias(user_id: Optional[str] = None, mode: Optional[str] = None):
+    return await get_status(user_id, mode)
 
-async def get_status(user_id: Optional[str] = None):
+async def get_status(user_id: Optional[str] = None, mode: Optional[str] = None):
     """
     Return bot running status.
 
     - If user_id is provided: return paper/live flags for that specific user.
     - If user_id is omitted: return global paper/live flags (any bot running).
     """
+    # If mode-specific request, return only that mode's running state
+    if mode in ("paper", "live"):
+        try:
+            resp = (
+                supabase.table("bots_config")
+                .select("is_running, updated_at, last_error")
+                .eq("user_id", user_id)
+                .eq("mode", mode)
+                .limit(1)
+                .execute()
+            )
+
+            if not resp.data:
+                return {
+                    "mode": mode,
+                    "is_running": False,
+                    "updated_at": utc_now_iso(),
+                    "last_error": None,
+                }
+
+            row = resp.data[0]
+            return {
+                "mode": mode,
+                "is_running": bool(row.get("is_running")),
+                "updated_at": row.get("updated_at", utc_now_iso()),
+                "last_error": row.get("last_error"),
+            }
+        except Exception as e:
+            print(f"Error fetching {mode} status:", e)
+            return {
+                "mode": mode,
+                "is_running": False,
+                "updated_at": utc_now_iso(),
+                "last_error": "Status fetch failed",
+            }
     try:
         if user_id:
             # Per-user status

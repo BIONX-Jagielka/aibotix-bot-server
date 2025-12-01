@@ -19,6 +19,11 @@ logging.basicConfig(
 
 logger = logging.getLogger("aibotix.worker")
 
+
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
 # ----------------------------------------
 # Supabase + Fernet setup
 # ----------------------------------------
@@ -111,7 +116,7 @@ async def update_bot_error(user_id: str, mode: str, error: str) -> None:
     def _update():
         return (
             supabase.table("bots_config")
-            .update({"is_running": False, "last_error": error, "updated_at": "now()"})
+            .update({"is_running": False, "last_error": error})
             .eq("user_id", user_id)
             .eq("mode", mode)
             .execute()
@@ -130,7 +135,7 @@ async def clear_bot_error(user_id: str, mode: str) -> None:
     def _update():
         return (
             supabase.table("bots_config")
-            .update({"last_error": None, "updated_at": "now()"})
+            .update({"last_error": None})
             .eq("user_id", user_id)
             .eq("mode", mode)
             .execute()
@@ -152,7 +157,7 @@ async def log_activity(user_id: str, mode: str, message: str) -> None:
                     "user_id": user_id,
                     "mode": mode,
                     "message": message,
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": utc_now_iso(),
                 }
             )
             .execute()
@@ -169,23 +174,22 @@ async def log_activity(user_id: str, mode: str, message: str) -> None:
         )
 
 
-async def mark_bot_status(user_id: str, mode: str, fields: Dict[str, Any]) -> None:
+async def upsert_runtime(user_id: str, mode: str, fields: Dict[str, Any]) -> None:
     """
-    Helper to update bot_status for a given user+mode.
-    This is best-effort only – failures are logged but do not crash the worker.
+    Shared helper to upsert into bot_runtime for a given user+mode.
+    This table stores live runtime metrics (heartbeat, last error, shutdown).
     """
     def _upsert():
-        payload = {
-            **fields,
-            "updated_at": "now()",
-        }
+        payload = {**fields}
         return (
-            supabase.table("bot_status")
-            .upsert({
-                "user_id": user_id,
-                "mode": mode,
-                **payload
-            })
+            supabase.table("bot_runtime")
+            .upsert(
+                {
+                    "user_id": user_id,
+                    "mode": mode,
+                    **payload,
+                }
+            )
             .execute()
         )
 
@@ -193,7 +197,7 @@ async def mark_bot_status(user_id: str, mode: str, fields: Dict[str, Any]) -> No
         await _run_supabase(_upsert)
     except Exception:
         logger.exception(
-            "Failed to update bot_status for user_id=%s mode=%s with %s",
+            "Failed to upsert bot_runtime for user_id=%s mode=%s with %s",
             user_id,
             mode,
             fields,
@@ -202,64 +206,48 @@ async def mark_bot_status(user_id: str, mode: str, fields: Dict[str, Any]) -> No
 
 async def mark_bot_running(user_id: str, mode: str) -> None:
     """
-    Mark bot as running and clear any unexpected shutdown flag.
+    Mark bot as running by updating last_heartbeat and clearing runtime error/shutdown.
     """
-    def _upsert():
-        payload = {
-            "running": True,
-            "unexpected_shutdown": False,
-            "stop_time": None,
-            "error": None,
-            "updated_at": "now()",
-        }
-        return (
-            supabase.table("bot_status")
-            .upsert({
-                "user_id": user_id,
-                "mode": mode,
-                **payload
-            })
-            .execute()
-        )
-    try:
-        await _run_supabase(_upsert)
-    except Exception:
-        logger.exception(
-            "Failed to mark bot as running for user_id=%s mode=%s",
-            user_id,
-            mode,
-        )
+    await upsert_runtime(
+        user_id,
+        mode,
+        {
+            "last_heartbeat": utc_now_iso(),
+            "last_error": None,
+            "last_shutdown": None,
+            "status": "running",
+            "message": "Bot running normally",
+        },
+    )
 
 
-async def mark_bot_stopped(user_id: str, mode: str, *, unexpected: bool) -> None:
+async def mark_bot_stopped(user_id: str, mode: str, *, error: Optional[str] = None) -> None:
     """
-    Mark bot as stopped. If unexpected=True, set unexpected_shutdown for UI.
+    Mark bot as stopped. Optionally persist the last error message.
     """
-    payload: Dict[str, Any] = {
-        "running": False,
-        "stop_time": "now()",
-        "updated_at": "now()",
+    fields: Dict[str, Any] = {
+        "last_shutdown": utc_now_iso(),
+        "status": "stopped",
     }
-    if unexpected:
-        payload["unexpected_shutdown"] = True
-    def _upsert():
-        return (
-            supabase.table("bot_status")
-            .upsert({
-                "user_id": user_id,
-                "mode": mode,
-                **payload
-            })
-            .execute()
-        )
-    try:
-        await _run_supabase(_upsert)
-    except Exception:
-        logger.exception(
-            "Failed to mark bot as stopped for user_id=%s mode=%s",
-            user_id,
-            mode,
-        )
+    if error is not None:
+        fields["last_error"] = error
+
+    await upsert_runtime(user_id, mode, fields)
+
+
+async def update_heartbeat(user_id: str, mode: str) -> None:
+    """
+    Lightweight heartbeat writer used while the bot is running.
+    """
+    await upsert_runtime(
+        user_id,
+        mode,
+        {
+            "last_heartbeat": utc_now_iso(),
+        },
+    )
+
+
 
 
 async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
@@ -389,14 +377,30 @@ async def worker_loop(poll_interval: int = 10) -> None:
             ai_tickers = await fetch_ai_tickers(user_id, mode)
 
             if not ai_tickers:
-                msg = "No AI-approved tickers configured; bot cannot start."
-                logger.warning("%s (user_id=%s, mode=%s)", msg, user_id, mode)
-                await update_bot_error(user_id, mode, msg)
-                await mark_bot_stopped(user_id, mode, unexpected=False)
-                await log_activity(user_id, mode, msg)
-                return
+                    msg = "Bot started, waiting for AI to choose the best tickers to trade"
+                    logger.info("%s (user_id=%s, mode=%s)", msg, user_id, mode)
 
-            # Clear last_error on successful startup
+                    # Clear previous errors
+                    await clear_bot_error(user_id, mode)
+
+                    # Mark bot as running but idle
+                    await upsert_runtime(
+                        user_id,
+                        mode,
+                        {
+                            "last_heartbeat": utc_now_iso(),
+                            "status": "idle_waiting",
+                            "message": msg,
+                            "last_error": None,
+                            "last_shutdown": None,
+                        }
+                    )
+
+                    # Log for UI
+                    await log_activity(user_id, mode, msg)
+
+                    # Do NOT stop the bot — remain active and check again later
+                    return            # Clear last_error on successful startup
             await clear_bot_error(user_id, mode)
             # Mark status as running for this user+mode
             await mark_bot_running(user_id, mode)
@@ -410,21 +414,21 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     mode,
                     strategy_id,
                 )
-                # Build session object for multi-user isolation
-                session = {
-                    "user_id": user_id,
-                    "mode": mode,
-                    "api_key": api_key,
-                    "api_secret": api_secret,
-                    "strategy_id": strategy_id,
-                    "allowed_tickers": ai_tickers,
-                }
-
+                # Initialize trading client with session data
+                from bot.aibotix_trading_bot import init_trading_client
+                init_trading_client(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    paper=(mode == "paper"),
+                    user_id=user_id,
+                    mode=mode
+                )
+                
                 # This call should be a long-lived loop inside the bot.
-                await trade_loop_async(session=session)
+                await trade_loop_async(allowed_tickers=ai_tickers)
                 await log_activity(user_id, mode, "trade_loop_async finished normally")
                 # Mark bot as stopped gracefully
-                await mark_bot_stopped(user_id, mode, unexpected=False)
+                await mark_bot_stopped(user_id, mode)
                 # If trade_loop_async returns normally, we just log and the worker
                 # will decide whether to restart it on the next poll, depending on is_running.
                 logger.info(
@@ -435,12 +439,13 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 )
             except asyncio.CancelledError:
                 await log_activity(user_id, mode, "Bot task cancelled")
-                # Mark as stopped but not unexpected – user likely toggled is_running off
-                await mark_bot_stopped(user_id, mode, unexpected=False)
+                # Mark as stopped without an error – user likely toggled is_running off
+                await mark_bot_stopped(user_id, mode)
                 logger.info("⏹ Bot task cancelled for %s", task_key)
                 raise
             except Exception as e:
-                await log_activity(user_id, mode, f"Bot crashed: {e!r}")
+                crash_msg = f"Bot crashed: {e!r}"
+                await log_activity(user_id, mode, crash_msg)
                 logger.exception(
                     "Bot crashed for %s (user_id=%s, mode=%s): %s",
                     task_key,
@@ -448,13 +453,13 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     mode,
                     e,
                 )
-                await update_bot_error(user_id, mode, f"Bot crashed: {e!r}")
-                # Mark unexpected shutdown for UI indicator
+                await update_bot_error(user_id, mode, crash_msg)
+                # Mark shutdown and persist error for UI indicator
                 try:
-                    await mark_bot_stopped(user_id, mode, unexpected=True)
+                    await mark_bot_stopped(user_id, mode, error=crash_msg)
                 except Exception:
                     logger.exception(
-                        "Failed to mark unexpected shutdown for user_id=%s mode=%s",
+                        "Failed to mark shutdown in bot_runtime for user_id=%s mode=%s",
                         user_id,
                         mode,
                     )
@@ -466,22 +471,12 @@ async def worker_loop(poll_interval: int = 10) -> None:
     while True:
         try:
             active_rows = await fetch_active_bots()
-            # Update heartbeat for all active bots
+            # Update heartbeat for all active bots in bot_runtime
             for row in active_rows:
                 uid = str(row.get("user_id"))
                 mode = row.get("mode", "paper")
-                def _hb():
-                    return (
-                        supabase.table("bot_status")
-                        .update({"last_heartbeat": "now()"})
-                        .eq("user_id", uid)
-                        .eq("mode", mode)
-                        .execute()
-                    )
-                try:
-                    await _run_supabase(_hb)
-                except Exception:
-                    logger.exception("Failed to update heartbeat for %s:%s", uid, mode)
+                if uid:
+                    await update_heartbeat(uid, mode)
 
             # Build the set of keys that *should* be running right now
             active_keys = {

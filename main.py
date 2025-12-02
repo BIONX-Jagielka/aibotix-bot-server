@@ -16,22 +16,23 @@ try:
     print("🚀 Starting AIBOTIX bot server...")
 
     SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
-    if not SUPABASE_URL or not SUPABASE_KEY or not ENCRYPTION_KEY:
-        raise EnvironmentError(
-            "❌ Missing SUPABASE_URL, SUPABASE_KEY, or ENCRYPTION_KEY"
-        )
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing in main.py")
+    
+    if not ENCRYPTION_KEY:
+        raise RuntimeError("ENCRYPTION_KEY is required but missing.")
 
     # Validate Fernet key format early
-    if not ENCRYPTION_KEY.endswith("="):
+    if ENCRYPTION_KEY and not ENCRYPTION_KEY.endswith("="):
         print("⚠️ Warning: Encryption key missing '=' padding — adding automatically.")
         ENCRYPTION_KEY = ENCRYPTION_KEY + "="
+    
+    fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
 
-    fernet = Fernet(ENCRYPTION_KEY.encode())
-
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
     print("✅ Supabase client and Fernet key initialized successfully.")
 except Exception as e:
@@ -77,6 +78,10 @@ def get_alpaca_keys(user_id: str, mode: str = "paper") -> Optional[tuple[str, st
         api_key_id = row["api_key_id"]
         api_secret_enc = row["api_secret_enc"]
 
+        if not fernet:
+            print(f"[{mode.upper()}] ENCRYPTION_KEY not available; cannot decrypt Alpaca secret")
+            return None
+        
         api_secret = fernet.decrypt(api_secret_enc.encode("utf-8")).decode("utf-8")
 
         return api_key_id, api_secret
@@ -303,6 +308,8 @@ async def start_bot(request: Request):
             log_bot_event(user_id, mode, "AI ticker selector returned no symbols.")
     except Exception as e:
         print(f"[{mode.upper()}] AI ticker selector failed for user {user_id}: {e}")
+        # NOTE: We do NOT block bot start when AI tickers fail because
+        # worker's idle_waiting state handles this safely by waiting for AI.
         log_bot_event(
             user_id,
             mode,

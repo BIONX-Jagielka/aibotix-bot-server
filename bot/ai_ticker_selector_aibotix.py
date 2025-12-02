@@ -31,6 +31,7 @@ from alpaca.trading.enums import AssetStatus
 load_dotenv()
 
 # --- Dynamic Client Initialization ---
+# TODO: Replace static APCA_API_KEY_ID and APCA_API_SECRET_KEY with per-user keys in future upgrade.
 def init_clients():
     api_key = os.getenv("APCA_API_KEY_ID")
     api_secret = os.getenv("APCA_API_SECRET_KEY")

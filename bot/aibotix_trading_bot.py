@@ -81,12 +81,12 @@ from alpaca.data.timeframe import TimeFrame
 from supabase import create_client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 supabase = None
-if SUPABASE_URL and SUPABASE_KEY:
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
         logging.info("Supabase logging initialised.")
     except Exception as e:
         logging.error(f"Failed to initialise Supabase client: {e}")
@@ -173,6 +173,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 # === Step 2: Dynamic per-user API initialization (Supabase-ready) ===
+# WARNING:
+# These globals are safe because AIBOTIX currently runs one active bot per worker.
+# When multi-bot support is added, move these into per-session state.
 def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_id: str | None = None, mode: str | None = None):
     global api, data_client, API_KEY, API_SECRET, USER_ID, CURRENT_MODE, SESSION
 

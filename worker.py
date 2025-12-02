@@ -39,9 +39,17 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 fernet: Optional[Fernet] = None
 if ENCRYPTION_KEY:
     try:
+        # Ensure proper Fernet padding if Render or env editing stripped '='
+        if not ENCRYPTION_KEY.endswith("="):
+            logger.warning(
+                "ENCRYPTION_KEY missing '=' padding in worker; adding automatically."
+            )
+            ENCRYPTION_KEY = ENCRYPTION_KEY + "="
         fernet = Fernet(ENCRYPTION_KEY.encode())
+        logger.info("Fernet encryption key initialised successfully in worker.")
     except Exception as e:
         logger.error("Invalid ENCRYPTION_KEY in worker: %s", e)
+        fernet = None
 else:
     logger.warning("ENCRYPTION_KEY not set; worker cannot decrypt Alpaca secrets")
 
@@ -105,7 +113,12 @@ async def fetch_alpaca_keys(user_id: str, mode: str) -> Optional[Dict[str, str]]
             "api_secret_enc": data["api_secret_enc"],
         }
     except Exception as e:
-        logger.exception("Failed to fetch Alpaca keys for user_id=%s mode=%s: %s", user_id, mode, e)
+        logger.exception(
+            "Failed to fetch Alpaca keys for user_id=%s mode=%s: %s",
+            user_id,
+            mode,
+            e,
+        )
         return None
 
 
@@ -130,7 +143,7 @@ async def update_bot_error(user_id: str, mode: str, error: str) -> None:
 
 async def clear_bot_error(user_id: str, mode: str) -> None:
     """
-    Optional helper to clear error when bot successfully restarts.
+    Clear last_error in bots_config when a bot successfully starts or recovers.
     """
     def _update():
         return (
@@ -177,7 +190,7 @@ async def log_activity(user_id: str, mode: str, message: str) -> None:
 async def upsert_runtime(user_id: str, mode: str, fields: Dict[str, Any]) -> None:
     """
     Shared helper to upsert into bot_runtime for a given user+mode.
-    This table stores live runtime metrics (heartbeat, last error, shutdown).
+    This table stores live runtime metrics (heartbeat, last error, shutdown, status).
     """
     def _upsert():
         payload = {**fields}
@@ -221,9 +234,15 @@ async def mark_bot_running(user_id: str, mode: str) -> None:
     )
 
 
-async def mark_bot_stopped(user_id: str, mode: str, *, error: Optional[str] = None) -> None:
+async def mark_bot_stopped(
+    user_id: str,
+    mode: str,
+    *,
+    error: Optional[str] = None,
+    message: Optional[str] = None,
+) -> None:
     """
-    Mark bot as stopped. Optionally persist the last error message.
+    Mark bot as stopped. Optionally persist the last error message and custom message.
     """
     fields: Dict[str, Any] = {
         "last_shutdown": utc_now_iso(),
@@ -231,13 +250,15 @@ async def mark_bot_stopped(user_id: str, mode: str, *, error: Optional[str] = No
     }
     if error is not None:
         fields["last_error"] = error
+    if message is not None:
+        fields["message"] = message
 
     await upsert_runtime(user_id, mode, fields)
 
 
 async def update_heartbeat(user_id: str, mode: str) -> None:
     """
-    Lightweight heartbeat writer used while the bot is running.
+    Lightweight heartbeat writer used while the bot is configured as running.
     """
     await upsert_runtime(
         user_id,
@@ -246,8 +267,6 @@ async def update_heartbeat(user_id: str, mode: str) -> None:
             "last_heartbeat": utc_now_iso(),
         },
     )
-
-
 
 
 async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
@@ -318,7 +337,7 @@ def decrypt_secret(enc: str) -> Optional[str]:
 
 
 # ----------------------------------------
-# Worker loop
+# Worker: bot task lifecycle
 # ----------------------------------------
 async def worker_loop(poll_interval: int = 10) -> None:
     """
@@ -327,7 +346,9 @@ async def worker_loop(poll_interval: int = 10) -> None:
       - for each (user_id, mode) ensures a trading task exists
       - gets per-user Alpaca keys from alpaca_keys
       - decrypts secrets with Fernet
+      - uses AI tickers if available; otherwise marks bot as idle/waiting
       - stops tasks when is_running becomes false
+
     This loop MUST NEVER exit on normal errors so Render thinks it's healthy.
     """
     logger.info("🔁 AIBOTIX worker loop started (multi-user, multi-bot)")
@@ -336,6 +357,11 @@ async def worker_loop(poll_interval: int = 10) -> None:
     bot_tasks: Dict[str, asyncio.Task] = {}
 
     async def ensure_bot_task(bot_row: Dict[str, Any]) -> None:
+        """
+        Ensure there is a running trading task for this bot (user_id+mode),
+        but only if AI tickers exist. If no AI tickers yet, we mark the bot
+        as idle/waiting and do NOT start trade_loop_async yet.
+        """
         user_id_raw = bot_row.get("user_id")
         if user_id_raw is None:
             logger.warning("bots_config row missing user_id: %s", bot_row)
@@ -343,7 +369,6 @@ async def worker_loop(poll_interval: int = 10) -> None:
 
         # In Supabase, user_id is uuid; we always treat as string in Python.
         user_id = str(user_id_raw)
-
         mode = bot_row.get("mode", "paper")
         strategy_id = bot_row.get("strategy_id", "default_rsi")
 
@@ -354,6 +379,38 @@ async def worker_loop(poll_interval: int = 10) -> None:
             # Task already running for this user+mode
             return
 
+        # Load AI-approved tickers for this user+mode
+        ai_tickers = await fetch_ai_tickers(user_id, mode)
+
+        if not ai_tickers:
+            # Bot is configured to run, but AI hasn't chosen tickers yet.
+            msg = "Bot started, waiting for AI to choose the best tickers to trade"
+            logger.info("%s (user_id=%s, mode=%s)", msg, user_id, mode)
+
+            # Clear previous errors
+            await clear_bot_error(user_id, mode)
+
+            # Mark bot as idle/waiting in runtime
+            await upsert_runtime(
+                user_id,
+                mode,
+                {
+                    "last_heartbeat": utc_now_iso(),
+                    "status": "idle_waiting",
+                    "message": msg,
+                    "last_error": None,
+                    "last_shutdown": None,
+                },
+            )
+
+            # Log for UI
+            await log_activity(user_id, mode, msg)
+
+            # Do NOT start trade_loop_async yet; we will re-check AI tickers
+            # on the next poll iteration.
+            return
+
+        # If we reach here, AI tickers exist – we can start the trading bot.
         async def run_bot_task() -> None:
             # 1) Fetch API keys for this user+mode
             creds = await fetch_alpaca_keys(user_id, mode)
@@ -361,6 +418,8 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 msg = "Missing Alpaca API keys; please configure credentials"
                 logger.error("%s (user_id=%s, mode=%s)", msg, user_id, mode)
                 await update_bot_error(user_id, mode, msg)
+                # Reflect error in runtime as well
+                await mark_bot_stopped(user_id, mode, error=msg, message=msg)
                 return
 
             api_key = creds["api_key"]
@@ -371,66 +430,47 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 msg = "Failed to decrypt Alpaca API secret"
                 logger.error("%s (user_id=%s, mode=%s)", msg, user_id, mode)
                 await update_bot_error(user_id, mode, msg)
+                await mark_bot_stopped(user_id, mode, error=msg, message=msg)
                 return
 
-            # Load AI-approved tickers for this user+mode
-            ai_tickers = await fetch_ai_tickers(user_id, mode)
-
-            if not ai_tickers:
-                    msg = "Bot started, waiting for AI to choose the best tickers to trade"
-                    logger.info("%s (user_id=%s, mode=%s)", msg, user_id, mode)
-
-                    # Clear previous errors
-                    await clear_bot_error(user_id, mode)
-
-                    # Mark bot as running but idle
-                    await upsert_runtime(
-                        user_id,
-                        mode,
-                        {
-                            "last_heartbeat": utc_now_iso(),
-                            "status": "idle_waiting",
-                            "message": msg,
-                            "last_error": None,
-                            "last_shutdown": None,
-                        }
-                    )
-
-                    # Log for UI
-                    await log_activity(user_id, mode, msg)
-
-                    # Do NOT stop the bot — remain active and check again later
-                    return            # Clear last_error on successful startup
+            # Clear previous config error and mark status as running
             await clear_bot_error(user_id, mode)
-            # Mark status as running for this user+mode
             await mark_bot_running(user_id, mode)
-
-            await log_activity(user_id, mode, f"Bot starting (strategy={strategy_id})")
+            await log_activity(
+                user_id,
+                mode,
+                f"Bot starting (strategy={strategy_id}, tickers={','.join(ai_tickers)})",
+            )
 
             try:
                 logger.info(
-                    "▶️ Starting bot for user_id=%s, mode=%s, strategy=%s",
+                    "▶️ Starting bot for user_id=%s, mode=%s, strategy=%s, tickers=%s",
                     user_id,
                     mode,
                     strategy_id,
+                    ai_tickers,
                 )
                 # Initialize trading client with session data
                 from bot.aibotix_trading_bot import init_trading_client
+
                 init_trading_client(
                     api_key=api_key,
                     api_secret=api_secret,
                     paper=(mode == "paper"),
                     user_id=user_id,
-                    mode=mode
+                    mode=mode,
                 )
-                
-                # This call should be a long-lived loop inside the bot.
+
+                # Long-lived trading loop:
                 await trade_loop_async(allowed_tickers=ai_tickers)
+
+                # If trade_loop_async ever returns normally, mark as stopped (no error)
                 await log_activity(user_id, mode, "trade_loop_async finished normally")
-                # Mark bot as stopped gracefully
-                await mark_bot_stopped(user_id, mode)
-                # If trade_loop_async returns normally, we just log and the worker
-                # will decide whether to restart it on the next poll, depending on is_running.
+                await mark_bot_stopped(
+                    user_id,
+                    mode,
+                    message="trade_loop_async finished normally",
+                )
                 logger.info(
                     "✅ trade_loop_async finished for user_id=%s, mode=%s (strategy=%s)",
                     user_id,
@@ -440,7 +480,11 @@ async def worker_loop(poll_interval: int = 10) -> None:
             except asyncio.CancelledError:
                 await log_activity(user_id, mode, "Bot task cancelled")
                 # Mark as stopped without an error – user likely toggled is_running off
-                await mark_bot_stopped(user_id, mode)
+                await mark_bot_stopped(
+                    user_id,
+                    mode,
+                    message="Bot task cancelled via is_running toggle",
+                )
                 logger.info("⏹ Bot task cancelled for %s", task_key)
                 raise
             except Exception as e:
@@ -456,7 +500,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 await update_bot_error(user_id, mode, crash_msg)
                 # Mark shutdown and persist error for UI indicator
                 try:
-                    await mark_bot_stopped(user_id, mode, error=crash_msg)
+                    await mark_bot_stopped(user_id, mode, error=crash_msg, message=crash_msg)
                 except Exception:
                     logger.exception(
                         "Failed to mark shutdown in bot_runtime for user_id=%s mode=%s",
@@ -471,12 +515,16 @@ async def worker_loop(poll_interval: int = 10) -> None:
     while True:
         try:
             active_rows = await fetch_active_bots()
-            # Update heartbeat for all active bots in bot_runtime
+
+            # Update heartbeat for all active bots in bot_runtime,
+            # whether or not AI tickers exist yet.
             for row in active_rows:
-                uid = str(row.get("user_id"))
+                uid_raw = row.get("user_id")
+                if uid_raw is None:
+                    continue
+                uid = str(uid_raw)
                 mode = row.get("mode", "paper")
-                if uid:
-                    await update_heartbeat(uid, mode)
+                await update_heartbeat(uid, mode)
 
             # Build the set of keys that *should* be running right now
             active_keys = {
@@ -485,11 +533,11 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 if r.get("user_id") is not None
             }
 
-            # Ensure tasks exist for each active bot
+            # Ensure tasks exist for each active bot (if AI tickers exist)
             for row in active_rows:
                 await ensure_bot_task(row)
 
-            # Cancel tasks that are no longer active
+            # Cancel tasks that are no longer active in bots_config
             for key, task in list(bot_tasks.items()):
                 if key not in active_keys:
                     logger.info("🛑 Stopping bot for %s (is_running flag turned off)", key)

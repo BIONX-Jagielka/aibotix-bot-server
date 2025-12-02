@@ -20,10 +20,18 @@ try:
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
     if not SUPABASE_URL or not SUPABASE_KEY or not ENCRYPTION_KEY:
-        raise EnvironmentError("❌ Missing one or more required environment variables: SUPABASE_URL, SUPABASE_KEY, ENCRYPTION_KEY")
+        raise EnvironmentError(
+            "❌ Missing SUPABASE_URL, SUPABASE_KEY, or ENCRYPTION_KEY"
+        )
+
+    # Validate Fernet key format early
+    if not ENCRYPTION_KEY.endswith("="):
+        print("⚠️ Warning: Encryption key missing '=' padding — adding automatically.")
+        ENCRYPTION_KEY = ENCRYPTION_KEY + "="
+
+    fernet = Fernet(ENCRYPTION_KEY.encode())
 
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    fernet = Fernet(ENCRYPTION_KEY.encode("utf-8"))
 
     print("✅ Supabase client and Fernet key initialized successfully.")
 except Exception as e:
@@ -367,6 +375,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", os.getenv("PORT", "10000"))),
+        port=int(os.environ.get("PORT", 10000)),
         log_level="info",
     )

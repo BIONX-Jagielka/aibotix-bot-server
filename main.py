@@ -129,6 +129,13 @@ def log_bot_event(user_id: str, mode: str, message: str) -> None:
 def read_root():
     return {"message": "AIBOTIX Bot Server is up and running!"}
 
+@app.get("/health")
+def health_check():
+    """
+    Health check endpoint used by Render to keep the service alive.
+    """
+    return {"status": "ok"}
+
 
 @app.get("/api/status")
 @app.get("/status")
@@ -360,6 +367,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
+        port=int(os.environ.get("PORT", os.getenv("PORT", "10000"))),
         log_level="info",
     )

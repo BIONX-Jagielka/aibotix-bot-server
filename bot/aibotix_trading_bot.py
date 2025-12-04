@@ -177,37 +177,51 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # These globals are safe because AIBOTIX currently runs one active bot per worker.
 # When multi-bot support is added, move these into per-session state.
 def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_id: str | None = None, mode: str | None = None):
+    """
+    Initialize trading and data clients for the correct environment (paper or live)
+    while attaching them to the correct BotSession.
+    """
+
     global api, data_client, API_KEY, API_SECRET, USER_ID, CURRENT_MODE, SESSION
 
-    # Store raw keys for debugging/backwards compatibility (avoid using directly elsewhere)
     API_KEY = api_key
     API_SECRET = api_secret
 
-    # Determine effective mode string
-    effective_mode = mode or ("paper" if paper else "live")
+    # Determine effective mode
+    # Explicit mode overrides paper=True/False
+    if mode:
+        effective_mode = mode
+        paper_mode = mode == "paper"
+    else:
+        paper_mode = paper
+        effective_mode = "paper" if paper else "live"
 
-    # Select or create a per-user BotSession
+    # Select or create session
     session = get_session(user_id, effective_mode)
 
-    # Keep module-level context for any legacy callers that still read USER_ID/CURRENT_MODE
     USER_ID = user_id
     CURRENT_MODE = effective_mode
 
-    # Create Alpaca trading & data clients
-    api = TradingClient(api_key, api_secret, paper=paper)
-    data_client = StockHistoricalDataClient(api_key, api_secret)
+    # ---------- ENVIRONMENT SEPARATION PATCH ----------
+    # Create Alpaca Trading client for correct environment
+    api = TradingClient(api_key, api_secret, paper=paper_mode)
 
-    # Attach them to the active session
+    # Create Alpaca Data client for correct environment
+    data_client = StockHistoricalDataClient(api_key, api_secret, paper=paper_mode)
+    # ----------------------------------------------------
+
+    # Attach to session
     session.api = api
     session.data_client = data_client
     session.USER_ID = user_id
     session.CURRENT_MODE = effective_mode
 
-    # Also update the global SESSION reference so existing code uses this session
+    # Keep SESSION globally updated
     SESSION = session
 
-    logging.info(f"Trading client initialised (paper={paper}, mode={effective_mode}).")
-    supabase_log(f"Trading client initialised (mode={effective_mode}, paper={paper}).")
+    logging.info(f"[Client Init] mode={effective_mode} paper={paper_mode}")
+    supabase_log(f"client_initialised | mode={effective_mode} | paper={paper_mode}")
+
     return api
 
 # Global placeholder. Start/stop routes will set this dynamically.

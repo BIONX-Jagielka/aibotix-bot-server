@@ -9,6 +9,13 @@ from supabase import create_client, Client
 
 from bot.aibotix_trading_bot import trade_loop_async
 
+# --- AI ticker selector imports ---
+from bot.ai_ticker_selector_aibotix import (
+    stage_a_screen_and_collect,
+    score_tickers,
+    save_ai_tickers,
+)
+
 # ----------------------------------------
 # Basic logging
 # ----------------------------------------
@@ -379,6 +386,21 @@ async def worker_loop(poll_interval: int = 10) -> None:
             # Task already running for this user+mode
             return
 
+        # --- AI Ticker Auto‑Generation Step ---
+        # Attempt to generate AI tickers if none exist yet
+        existing_ai = await fetch_ai_tickers(user_id, mode)
+        if not existing_ai:
+            try:
+                raw_scan = await stage_a_screen_and_collect()
+                scored = score_tickers(raw_scan)
+                await asyncio.to_thread(save_ai_tickers, user_id, mode, scored)
+                logger.info("AI tickers generated for user_id=%s mode=%s: %s", user_id, mode, scored)
+                
+                # Force refresh to start bot instantly
+                await asyncio.sleep(0.2)
+                ai_tickers = await fetch_ai_tickers(user_id, mode)
+            except Exception as e:
+                logger.error("AI selector failed for user_id=%s mode=%s: %s", user_id, mode, e)
         # Load AI-approved tickers for this user+mode
         ai_tickers = await fetch_ai_tickers(user_id, mode)
 

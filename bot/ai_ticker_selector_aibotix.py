@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 # --- Supabase Client for AI Ticker Persistence ---
 from supabase import create_client, Client
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -20,26 +20,54 @@ supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
+if not supabase:
+    raise RuntimeError(
+        "[AI-SELECTOR ERROR] Supabase client failed to initialise. "
+        "Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in environment variables."
+    )
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetAssetsRequest
-from alpaca.trading.enums import AssetStatus
 
 # --- Load Environment Variables ---
 load_dotenv()
 
 # --- Dynamic Client Initialization ---
-# TODO: Replace static APCA_API_KEY_ID and APCA_API_SECRET_KEY with per-user keys in future upgrade.
-def init_clients():
-    api_key = os.getenv("APCA_API_KEY_ID")
-    api_secret = os.getenv("APCA_API_SECRET_KEY")
-    mode = os.getenv("BOT_MODE", "paper")
-    paper = mode.lower() == "paper"
+def init_clients(mode: Optional[str] = None) -> Tuple[StockHistoricalDataClient, TradingClient]:
+    """
+    Initialise Alpaca clients using *AI selector–specific API keys*.
+    Keys depend on the mode ("paper" or "live").
+    This prevents AI selector from using user trading keys and keeps
+    all market-scanning activity centralised and scalable.
+    """
 
+    effective_mode = (mode or os.getenv("BOT_MODE", "paper")).lower()
+    paper = effective_mode == "paper"
+
+    if paper:
+        api_key = os.getenv("AI_SELECTOR_PAPER_API_KEY")
+        api_secret = os.getenv("AI_SELECTOR_PAPER_API_SECRET")
+    else:
+        api_key = os.getenv("AI_SELECTOR_LIVE_API_KEY")
+        api_secret = os.getenv("AI_SELECTOR_LIVE_API_SECRET")
+
+    # Strict validation so Render errors are visible immediately
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            f"[AI-SELECTOR ERROR] Missing API keys for mode={effective_mode}. "
+            "Ensure the following env variables exist:\n"
+            "  - AI_SELECTOR_PAPER_API_KEY\n"
+            "  - AI_SELECTOR_PAPER_API_SECRET\n"
+            "  - AI_SELECTOR_LIVE_API_KEY\n"
+            "  - AI_SELECTOR_LIVE_API_SECRET"
+        )
+
+    # Now safely initialise clients
     data_client = StockHistoricalDataClient(api_key, api_secret)
     trading_client = TradingClient(api_key, api_secret, paper=paper)
+
     return data_client, trading_client
 
 # --- Logger Setup ---
@@ -65,9 +93,9 @@ def compute_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-async def fetch_indicators(symbol):
+async def fetch_indicators(symbol: str, mode: str):
     try:
-        data_client, trading_client = init_clients()
+        data_client, trading_client = init_clients(mode)
         bars_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=100)
         bars = data_client.get_stock_bars(bars_req).df
         if bars.empty:
@@ -95,8 +123,8 @@ async def fetch_indicators(symbol):
         # Do not raise here – return None so other symbols can still be processed
         return None
 
-async def stage_a_screen_and_collect(limit=5):
-    data_client, trading_client = init_clients()
+async def stage_a_screen_and_collect(mode: str, limit: int = 5):
+    data_client, trading_client = init_clients(mode)
     failed_symbols = []  # Initialize the failed_symbols list
     try:
         assets = trading_client.get_all_assets()
@@ -155,7 +183,7 @@ async def stage_a_screen_and_collect(limit=5):
         logging.warning("No symbols passed the volume filter; returning empty indicator results.")
         return []
 
-    tasks = [fetch_indicators(sym) for sym in symbols_for_indicators]
+    tasks = [fetch_indicators(sym, mode) for sym in symbols_for_indicators]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for symbol, df in zip(symbols_for_indicators, results):
@@ -173,13 +201,13 @@ async def stage_a_screen_and_collect(limit=5):
     return indicator_results
 
 
-def get_open_position_symbols():
+def get_open_position_symbols(mode: str):
     """
     Returns a set of symbols the account is already holding.
     Prevents the AI selector from opening duplicate positions.
     """
     try:
-        data_client, trading_client = init_clients()
+        data_client, trading_client = init_clients(mode)
         positions = trading_client.get_all_positions()
         return {p.symbol for p in positions}
     except Exception as e:
@@ -246,7 +274,7 @@ def unified_ai_score(
 
     return score
 
-def score_tickers(indicator_results, top_n=5):
+def score_tickers(indicator_results, mode: str, top_n: int = 5):
     """
     Score tickers using the unified multi-factor model so that
     live AI screening is aligned with the trading bot's signal logic.
@@ -273,14 +301,13 @@ def score_tickers(indicator_results, top_n=5):
 
         scored.append((symbol, score_val))
 
+    # Apply soft feedback adjustments before sorting
+    scored = adjust_scoring_with_feedback(scored)
     # Sort by unified AI score (highest first)
     sorted_scored = sorted(scored, key=lambda x: x[1], reverse=True)
 
-    # Apply soft feedback adjustments
-    sorted_scored = adjust_scoring_with_feedback(sorted_scored)
-
     # Filter out duplicates and open positions
-    open_symbols = get_open_position_symbols()
+    open_symbols = get_open_position_symbols(mode)
     filtered = []
     seen = set()
 
@@ -406,10 +433,46 @@ def save_ai_tickers(
     except Exception as e:
         print(f"[AI-Tickers] Failed to save tickers for user_id={user_id} mode={mode}: {e!r}")
 
+
+def fetch_ai_tickers(user_id: str, mode: str):
+    """
+    Retrieve previously saved AI tickers for this user+mode.
+    Worker relies on this to immediately start trading after
+    new symbols are generated.
+    """
+    if not supabase:
+        print("[AI-Tickers] Supabase not configured — cannot fetch tickers.")
+        return []
+
+    try:
+        resp = (
+            supabase.table("ai_tickers")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("mode", mode)
+            .single()
+            .execute()
+        )
+
+        data = resp.data
+        if not data:
+            return []
+
+        tickers = data.get("tickers", [])
+        if not tickers:
+            return []
+
+        return tickers
+    except Exception as e:
+        print(f"[AI-Tickers] Failed to fetch tickers for user_id={user_id} mode={mode}: {e}")
+        return []
+
+
 if __name__ == "__main__":
-    results = asyncio.run(stage_a_screen_and_collect())
+    default_mode = os.getenv("BOT_MODE", "paper")
+    results = asyncio.run(stage_a_screen_and_collect(default_mode))
     log_selected_tickers_for_learning(results)
-    top = score_tickers(results)
+    top = score_tickers(results, default_mode)
 
 def get_top_tickers(indicator_log_csv='ai_ticker_learning_log.csv', top_n=5):
     try:

@@ -278,8 +278,8 @@ async def update_heartbeat(user_id: str, mode: str) -> None:
 
 async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
     """
-    Load AI-approved tickers for this user+mode from ai_tickers table.
-    Returns None if no tickers are configured.
+    Safe loader for AI tickers. Returns None when 0 rows exist (first‑run),
+    instead of treating it as an error. Prevents PGRST116 exceptions.
     """
     def _query():
         return (
@@ -287,7 +287,7 @@ async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
             .select("tickers")
             .eq("user_id", user_id)
             .eq("mode", mode)
-            .single()
+            .limit(1)
             .execute()
         )
 
@@ -295,28 +295,41 @@ async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
         res = await _run_supabase(_query)
         data = getattr(res, "data", None)
 
+        # If no rows exist yet → expected on first boot
         if not data:
             logger.info(
-                "No AI tickers configured for user_id=%s mode=%s; bot will stay idle.",
+                "No AI tickers found for user_id=%s mode=%s (first‑run or not generated yet).",
                 user_id,
                 mode,
             )
             return None
 
-        tickers = data.get("tickers") or []
+        row = data[0] if isinstance(data, list) else data
+        tickers = row.get("tickers") or []
 
         if not tickers:
             logger.info(
-                "AI tickers row exists but list empty for user_id=%s mode=%s; bot idle.",
+                "AI tickers row exists but empty for user_id=%s mode=%s; waiting.",
                 user_id,
                 mode,
             )
             return None
 
         return tickers
+
     except Exception as e:
+        msg = str(e)
+        # Safe handling for Supabase "0 rows" error
+        if "PGRST116" in msg or "0 rows" in msg:
+            logger.info(
+                "AI tickers not ready yet for user_id=%s mode=%s (Supabase returned empty).",
+                user_id,
+                mode,
+            )
+            return None
+
         logger.exception(
-            "Failed to fetch AI tickers for user_id=%s mode=%s: %s",
+            "Unexpected error while fetching AI tickers for user_id=%s mode=%s: %s",
             user_id,
             mode,
             e,

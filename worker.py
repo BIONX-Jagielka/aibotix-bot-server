@@ -405,7 +405,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
         if not existing_ai:
             try:
                 raw_scan = await stage_a_screen_and_collect(mode=mode)
-                scored = score_tickers(raw_scan)
+                scored = score_tickers(raw_scan, mode=mode)
                 await asyncio.to_thread(save_ai_tickers, user_id, mode, scored)
                 logger.info("AI tickers generated for user_id=%s mode=%s: %s", user_id, mode, scored)
                 

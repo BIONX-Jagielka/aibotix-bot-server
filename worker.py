@@ -4,7 +4,8 @@ import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from base64 import b64decode
 from supabase import create_client, Client
 
 from bot.aibotix_trading_bot import trade_loop_async
@@ -32,7 +33,7 @@ def utc_now_iso() -> str:
 
 
 # ----------------------------------------
-# Supabase + Fernet setup
+# Supabase + AES setup
 # ----------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -42,23 +43,6 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set for worker")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-fernet: Optional[Fernet] = None
-if ENCRYPTION_KEY:
-    try:
-        # Ensure proper Fernet padding if Render or env editing stripped '='
-        if not ENCRYPTION_KEY.endswith("="):
-            logger.warning(
-                "ENCRYPTION_KEY missing '=' padding in worker; adding automatically."
-            )
-            ENCRYPTION_KEY = ENCRYPTION_KEY + "="
-        fernet = Fernet(ENCRYPTION_KEY.encode())
-        logger.info("Fernet encryption key initialised successfully in worker.")
-    except Exception as e:
-        logger.error("Invalid ENCRYPTION_KEY in worker: %s", e)
-        fernet = None
-else:
-    logger.warning("ENCRYPTION_KEY not set; worker cannot decrypt Alpaca secrets")
 
 
 # ----------------------------------------
@@ -340,19 +324,34 @@ async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
 # ----------------------------------------
 # Crypto helper
 # ----------------------------------------
-def decrypt_secret(enc: str) -> Optional[str]:
-    if not enc:
-        return None
-    if not fernet:
-        logger.error("ENCRYPTION_KEY not available; cannot decrypt Alpaca secret")
-        return None
+def decrypt_secret(enc_b64: str) -> Optional[str]:
+    """
+    Decrypt AES-256-GCM secret produced by Next.js API (save-keys route).
+    Layout: [12-byte IV][16-byte TAG][ciphertext] all base64 encoded.
+    ENV: ENCRYPTION_KEY must be a 32-byte key already base64-decoded.
+    """
     try:
-        return fernet.decrypt(enc.encode()).decode()
-    except InvalidToken:
-        logger.error("Invalid Fernet token while decrypting Alpaca secret")
-        return None
+        if not ENCRYPTION_KEY:
+            logger.error("ENCRYPTION_KEY missing — cannot decrypt")
+            return None
+
+        key = b64decode(ENCRYPTION_KEY)
+        raw = b64decode(enc_b64)
+
+        iv = raw[:12]
+        tag = raw[12:28]
+        ciphertext = raw[28:]
+
+        decryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(iv, tag),
+        ).decryptor()
+
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        return plaintext.decode()
+
     except Exception as e:
-        logger.exception("Unexpected error decrypting Alpaca secret: %s", e)
+        logger.error("AES-GCM decrypt failed: %s", e)
         return None
 
 

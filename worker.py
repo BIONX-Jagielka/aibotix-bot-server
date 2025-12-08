@@ -348,7 +348,15 @@ def decrypt_secret(enc_b64: str) -> Optional[str]:
         ).decryptor()
 
         plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-        return plaintext.decode()
+
+        # NEW: decode Base64 layer automatically
+        import base64
+        try:
+            decoded = base64.b64decode(plaintext).decode()
+            return decoded
+        except Exception:
+            # fallback if plaintext was already raw text
+            return plaintext.decode()
 
     except Exception as e:
         logger.error("AES-GCM decrypt failed: %s", e)

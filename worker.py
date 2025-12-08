@@ -356,6 +356,35 @@ def decrypt_secret(enc_b64: str) -> Optional[str]:
 
 
 # ----------------------------------------
+# Helper: Save equity snapshot
+# ----------------------------------------
+async def save_equity_snapshot(supabase, user_id: str, account):
+    try:
+        equity = float(account.portfolio_value)
+        cash = float(account.cash)
+        pos_val = float(getattr(account, "position_market_value", 0))
+
+        def _insert():
+            return (
+                supabase.table("equity_history")
+                .insert(
+                    {
+                        "user_id": user_id,
+                        "equity": equity,
+                        "cash": cash,
+                        "positions_value": pos_val,
+                    }
+                )
+                .execute()
+            )
+
+        await asyncio.to_thread(_insert)
+
+    except Exception as e:
+        logger.error("Failed to save equity snapshot: %s", e)
+
+
+# ----------------------------------------
 # Worker: bot task lifecycle
 # ----------------------------------------
 async def worker_loop(poll_interval: int = 10) -> None:
@@ -550,6 +579,13 @@ async def worker_loop(poll_interval: int = 10) -> None:
         try:
             active_rows = await fetch_active_bots()
 
+            # Equity snapshot throttling
+            now_ts = datetime.utcnow().timestamp()
+            if not hasattr(worker_loop, "_last_equity_save"):
+                worker_loop._last_equity_save = 0
+
+            should_save_equity = (now_ts - worker_loop._last_equity_save) >= 300
+
             # Update heartbeat for all active bots in bot_runtime,
             # whether or not AI tickers exist yet.
             for row in active_rows:
@@ -559,6 +595,17 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 uid = str(uid_raw)
                 mode = row.get("mode", "paper")
                 await update_heartbeat(uid, mode)
+
+                # Fetch account & save equity every 5 minutes
+                if should_save_equity:
+                    try:
+                        from bot.aibotix_trading_bot import get_trading_client
+                        client = get_trading_client(uid, mode)
+                        if client:
+                            account = await client.get_account()
+                            await save_equity_snapshot(supabase, uid, account)
+                    except Exception as e:
+                        logger.error("Equity snapshot error for user_id=%s mode=%s: %s", uid, mode, e)
 
             # Build the set of keys that *should* be running right now
             active_keys = {
@@ -583,6 +630,9 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     except asyncio.CancelledError:
                         pass
                     del bot_tasks[key]
+
+            if should_save_equity:
+                worker_loop._last_equity_save = now_ts
 
         except Exception:
             # We NEVER let an exception break the worker – just log and continue

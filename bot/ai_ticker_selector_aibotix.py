@@ -357,18 +357,27 @@ def log_selected_tickers_for_learning(indicator_results):
     try:
         log_file = "ai_ticker_learning_log.csv"
         rows = []
-        for symbol, data in indicator_results:
+        for entry in indicator_results:
+            # entry is a dict with indicator fields
+            symbol = entry.get("symbol")
+            if not symbol:
+                continue
+
             row = {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "symbol": symbol,
-                "rsi": round(data["rsi"], 2),
-                "atr": round(data["atr"], 4),
-                "ema_crossover": data["ema_crossover"],
-                "volume_ratio": round(data["volume_ratio"], 2),
-                "slope": round(data["slope"], 4),
-                "gap": round(data["gap"], 4),
+                "rsi": round(float(entry.get("rsi", 0.0)), 2),
+                "atr": round(float(entry.get("atr", 0.0)), 4),
+                "ema_crossover": bool(entry.get("ema_crossover", False)),
+                "volume_ratio": round(float(entry.get("volume_ratio", 0.0)), 2),
+                "slope": round(float(entry.get("slope", 0.0)), 4),
+                "gap": round(float(entry.get("gap", 0.0)), 4),
             }
             rows.append(row)
+
+        if not rows:
+            logging.info("No indicator rows to log for learning.")
+            return
 
         df = pd.DataFrame(rows)
         if os.path.exists(log_file):
@@ -420,46 +429,90 @@ def record_trade_feedback(symbol, profit, filename="ai_ticker_feedback.csv"):
     except Exception as e:
         logging.warning(f"Failed to record feedback: {e}")
 
-def save_ai_tickers(
-    user_id: str,
-    mode: str,
-    tickers: List[str],
-    scores: Optional[Dict[str, Any]] = None,
-) -> None:
+def save_ai_tickers(user_id: str, mode: str, tickers):
     """
-    Store AI-selected tickers for user+mode into Supabase ai_tickers table.
-    Overwrites existing entries for that user+mode.
+    Save AI-selected tickers to the ai_tickers table in a row-based format.
+
+    tickers can be either:
+      - a list of plain symbols: ["AAPL", "TSLA", ...]
+      - or a list of dicts like:
+        {
+          "ticker": "AAPL",
+          "rank": 1,
+          "score": 0.89,
+          "rsi": 41.2,
+          "atrp": 0.011,
+          "macd": 0.003,
+          "sentiment": 0.10,
+        }
+
+    This function normalises both formats to the unified schema.
     """
     if not supabase:
         print("[AI-Tickers] Supabase client not configured — cannot save tickers.")
         return
 
-    payload = {
-        "user_id": user_id,
-        "mode": mode,
-        "tickers": tickers,
-        "score_json": scores or {},
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    try:
+        # Always clear old results for this user/mode
+        supabase.table("ai_tickers").delete().match({
+            "user_id": user_id,
+            "mode": mode,
+        }).execute()
+    except Exception as e:
+        print(f"[AI-Tickers] Failed to clear old tickers for user_id={user_id} mode={mode}: {e!r}")
+
+    # Normalise to list of dicts
+    payload = []
+    if not tickers:
+        print(f"[AI-Tickers] No tickers provided for user_id={user_id} mode={mode}")
+        return
+
+    if isinstance(tickers[0], str):
+        # Simple list of symbols
+        for idx, symbol in enumerate(tickers, start=1):
+            payload.append({
+                "user_id": user_id,
+                "mode": mode,
+                "ticker": symbol,
+                "rank": idx,
+            })
+    else:
+        # List of dicts
+        for idx, t in enumerate(tickers, start=1):
+            symbol = t.get("ticker") or t.get("symbol")
+            if not symbol:
+                continue
+
+            payload.append({
+                "user_id": user_id,
+                "mode": mode,
+                "ticker": symbol,
+                "rank": t.get("rank", idx),
+                "score": t.get("score"),
+                "rsi": t.get("rsi"),
+                "atrp": t.get("atrp") or t.get("atr_pct"),
+                "macd": t.get("macd"),
+                "sentiment": t.get("sentiment"),
+            })
+
+    if not payload:
+        print(f"[AI-Tickers] Normalised payload is empty for user_id={user_id} mode={mode}")
+        return
 
     try:
-        (
-            supabase.table("ai_tickers")
-            .upsert(payload, on_conflict="user_id,mode")
-            .execute()
-        )
-        print(
-            f"[AI-Tickers] Saved {len(tickers)} tickers for user_id={user_id} mode={mode}: {tickers}"
-        )
+        supabase.table("ai_tickers").insert(payload).execute()
+        print(f"[AI-Tickers] Saved {len(payload)} ticker rows for user_id={user_id} mode={mode}")
     except Exception as e:
         print(f"[AI-Tickers] Failed to save tickers for user_id={user_id} mode={mode}: {e!r}")
 
 
 def fetch_ai_tickers(user_id: str, mode: str):
     """
-    Retrieve previously saved AI tickers for this user+mode.
-    Worker relies on this to immediately start trading after
-    new symbols are generated.
+    Retrieve previously saved AI tickers for this user+mode
+    from the row-based ai_tickers table.
+
+    Returns a list of ticker symbols ordered by rank:
+      ["AAPL", "TSLA", ...]
     """
     if not supabase:
         print("[AI-Tickers] Supabase not configured — cannot fetch tickers.")
@@ -468,24 +521,22 @@ def fetch_ai_tickers(user_id: str, mode: str):
     try:
         resp = (
             supabase.table("ai_tickers")
-            .select("*")
+            .select("ticker, rank")
             .eq("user_id", user_id)
             .eq("mode", mode)
-            .single()
+            .order("rank", ascending=True)
             .execute()
         )
 
-        data = resp.data
-        if not data:
+        rows = resp.data or []
+        if not rows:
             return []
 
-        tickers = data.get("tickers", [])
-        if not tickers:
-            return []
-
+        tickers = [row["ticker"] for row in rows if row.get("ticker")]
         return tickers
     except Exception as e:
         print(f"[AI-Tickers] Failed to fetch tickers for user_id={user_id} mode={mode}: {e}")
+        return []
         return []
 
 
@@ -497,53 +548,82 @@ if __name__ == "__main__":
 
 def get_top_tickers(limit: int, user_id: str, mode: str):
     """
-    Returns a ranked list of top tickers AND writes the full scoring detail
-    to the ai_tickers table in Supabase for dashboard display.
-    """
+    Central AI selection function.
 
-    # --- Step 1: compute internal scores (using existing scoring logic) ---
-    try:
-        # Use existing stage_a_screen_and_collect to get scored data
-        scored_results = asyncio.run(stage_a_screen_and_collect(mode=mode, limit=50))
-        
-        # Results are already scored from stage_a_screen_and_collect
-        if not scored_results:
-            logging.warning("No scored results from stage_a_screen_and_collect")
-            return []
-            
-    except Exception as e:
-        logging.error(f"Error computing AI scores: {e}")
+    - Runs stage_a_screen_and_collect(mode) to compute indicators + scores.
+    - Sorts results by 'score' (highest first).
+    - Writes the top N tickers into the ai_tickers table (row-based).
+    - Returns the ordered list of ticker symbols for the worker.
+
+    Note: This function is synchronous and is expected to be called
+    from a background thread (e.g. via asyncio.to_thread in worker.py),
+    so it safely uses asyncio.run() internally.
+    """
+    if not supabase:
+        logging.warning("[AI-Tickers] Supabase client not configured — returning empty ticker list.")
         return []
 
-    # Sort by score descending and take top limit
-    scored_sorted = sorted(scored_results, key=lambda x: x["score"], reverse=True)[:limit]
-
-    # Add rank field
-    for idx, r in enumerate(scored_sorted):
-        r["rank"] = idx + 1
-
-    # --- Step 2: Save results to Supabase so Next.js dashboard can display them ---
+    # --- Step 1: compute scores via the async pipeline ---
     try:
-        if supabase:
-            supabase.table("ai_tickers").upsert(
-                [
-                    {
-                        "user_id": user_id,
-                        "mode": mode,
-                        "symbol": r["symbol"],
-                        "score": r["score"],
-                        "rsi": r["rsi"],
-                        "atr_pct": r["atr_pct"],
-                        "macd": r["macd"],
-                        "sentiment": r["sentiment"],
-                        "volume": r["volume"],
-                        "rank": r["rank"],
-                    }
-                    for r in scored_sorted
-                ]
-            ).execute()
+        indicator_results = asyncio.run(stage_a_screen_and_collect(mode=mode))
     except Exception as e:
-        print("AI Ticker save error:", e)
+        logging.error("Error computing AI scores: %s", e)
+        return []
 
-    # Worker only needs list of symbols
-    return [r["symbol"] for r in scored_sorted]
+    if not indicator_results:
+        logging.warning("No indicator results from AI selector.")
+        return []
+
+    # Keep only entries that have a valid score
+    scored = [r for r in indicator_results if r.get("score") is not None]
+    if not scored:
+        logging.warning("Indicator results contained no valid scores.")
+        return []
+
+    # Sort by score descending and take top 'limit'
+    scored_sorted = sorted(scored, key=lambda r: r["score"], reverse=True)[:limit]
+
+    rows = []
+    tickers = []
+
+    for idx, r in enumerate(scored_sorted, start=1):
+        symbol = r.get("symbol")
+        if not symbol:
+            continue
+
+        tickers.append(symbol)
+        rows.append({
+            "user_id": user_id,
+            "mode": mode,
+            "ticker": symbol,
+            "rank": idx,
+            "score": float(r.get("score") or 0.0),
+            "rsi": float(r.get("rsi") or 0.0),
+            "atrp": float(r.get("atr_pct") or 0.0),
+            "macd": float(r.get("macd") or 0.0),
+            "sentiment": float(r.get("sentiment") or 0.0),
+        })
+
+    if not rows:
+        logging.warning("No valid rows produced by get_top_tickers.")
+        return []
+
+    # --- Step 2: overwrite ai_tickers for this user/mode ---
+    try:
+        supabase.table("ai_tickers").delete().match({
+            "user_id": user_id,
+            "mode": mode,
+        }).execute()
+
+        supabase.table("ai_tickers").insert(rows).execute()
+        logging.info(
+            "[AI-Tickers] Saved %d rows for user_id=%s mode=%s; symbols=%s",
+            len(rows),
+            user_id,
+            mode,
+            tickers,
+        )
+    except Exception as e:
+        logging.error("[AI-Tickers] Failed to save AI tickers: %r", e)
+
+    return tickers

@@ -4,7 +4,8 @@ from typing import Optional
 
 from fastapi import FastAPI, Request
 from supabase import create_client, Client
-from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from base64 import b64decode
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,16 +26,9 @@ try:
     if not ENCRYPTION_KEY:
         raise RuntimeError("ENCRYPTION_KEY is required but missing.")
 
-    # Validate Fernet key format early
-    if ENCRYPTION_KEY and not ENCRYPTION_KEY.endswith("="):
-        print("⚠️ Warning: Encryption key missing '=' padding — adding automatically.")
-        ENCRYPTION_KEY = ENCRYPTION_KEY + "="
-    
-    fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
-
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-    print("✅ Supabase client and Fernet key initialized successfully.")
+    print("✅ Supabase client and AES-256-GCM encryption initialized successfully.")
 except Exception as e:
     import traceback
 
@@ -49,6 +43,39 @@ app = FastAPI()
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
+def decrypt_secret(enc_b64: str) -> Optional[str]:
+    """
+    Decrypt AES-256-GCM secret produced by the aibotix-homepage save-keys route.
+
+    ENV: ENCRYPTION_KEY must be a 32-byte key in base64 format.
+    """
+    try:
+        if not ENCRYPTION_KEY:
+            print("ERROR: ENCRYPTION_KEY missing — cannot decrypt")
+            return None
+
+        key = b64decode(ENCRYPTION_KEY)
+        enc_data = b64decode(enc_b64)
+
+        # Layout must match homepage encryption and worker.py:
+        # IV (12 bytes) + ciphertext (middle) + TAG (last 16 bytes)
+        iv = enc_data[:12]
+        tag = enc_data[-16:]
+        ciphertext = enc_data[12:-16]
+
+        decryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(iv, tag),
+        ).decryptor()
+
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        return plaintext.decode()
+
+    except Exception as e:
+        print(f"AES-GCM decrypt failed: {e}")
+        return None
+
+
 def utc_now_iso() -> str:
     """Return current UTC time as ISO string."""
     return datetime.now(timezone.utc).isoformat()
@@ -78,11 +105,11 @@ def get_alpaca_keys(user_id: str, mode: str = "paper") -> Optional[tuple[str, st
         api_key_id = row["api_key_id"]
         api_secret_enc = row["api_secret_enc"]
 
-        if not fernet:
-            print(f"[{mode.upper()}] ENCRYPTION_KEY not available; cannot decrypt Alpaca secret")
+        # Decrypt the API secret using AES-256-GCM
+        api_secret = decrypt_secret(api_secret_enc)
+        if not api_secret:
+            print(f"[{mode.upper()}] Failed to decrypt API secret for user {user_id}")
             return None
-        
-        api_secret = fernet.decrypt(api_secret_enc.encode("utf-8")).decode("utf-8")
 
         return api_key_id, api_secret
     except Exception as e:

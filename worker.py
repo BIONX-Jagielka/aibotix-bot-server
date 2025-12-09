@@ -328,7 +328,7 @@ def decrypt_secret(enc_b64: str) -> Optional[str]:
     """
     Decrypt AES-256-GCM secret produced by Next.js API (save-keys route).
     Layout: [12-byte IV][16-byte TAG][ciphertext] all base64 encoded.
-    ENV: ENCRYPTION_KEY must be a 32-byte key already base64-decoded.
+    ENV: ENCRYPTION_KEY must be a 32-byte key in base64 format.
     """
     try:
         if not ENCRYPTION_KEY:
@@ -349,14 +349,7 @@ def decrypt_secret(enc_b64: str) -> Optional[str]:
 
         plaintext = decryptor.update(ciphertext) + decryptor.finalize()
 
-        # NEW: decode Base64 layer automatically
-        import base64
-        try:
-            decoded = base64.b64decode(plaintext).decode()
-            return decoded
-        except Exception:
-            # fallback if plaintext was already raw text
-            return plaintext.decode()
+        return plaintext.decode()
 
     except Exception as e:
         logger.error("AES-GCM decrypt failed: %s", e)
@@ -401,7 +394,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
       - polls bots_config for all rows with is_running = true
       - for each (user_id, mode) ensures a trading task exists
       - gets per-user Alpaca keys from alpaca_keys
-      - decrypts secrets with Fernet
+      - decrypts secrets with AES-256-GCM
       - uses AI tickers if available; otherwise marks bot as idle/waiting
       - stops tasks when is_running becomes false
 

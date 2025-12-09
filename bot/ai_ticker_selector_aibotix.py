@@ -195,7 +195,27 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
         if df is not None and len(df) > 10:
             latest = df.iloc[-1]
             logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
-            indicator_results.append((symbol, latest))
+            indicator_results.append({
+                "symbol": symbol,
+                "rsi": latest['rsi'],
+                "atr": latest['atr'],
+                "atr_pct": latest['atr'] * 100,  # Convert to percentage
+                "macd": latest.get('macd', 0),
+                "sentiment": latest.get('sentiment', 0),
+                "volume": latest.get('volume', 0),
+                "ema_crossover": latest['ema_crossover'],
+                "volume_ratio": latest['volume_ratio'],
+                "slope": latest['slope'],
+                "gap": latest['gap'],
+                "score": unified_ai_score(
+                    rsi=latest['rsi'],
+                    atr=latest['atr'],
+                    ema_crossover=latest['ema_crossover'],
+                    volume_ratio=latest['volume_ratio'],
+                    slope=latest['slope'],
+                    gap=latest['gap'],
+                ) or 0.0
+            })
 
     logging.info(f"{len(indicator_results)} tickers gathered with indicators after screening.")
     return indicator_results
@@ -280,13 +300,14 @@ def score_tickers(indicator_results, mode: str, top_n: int = 5):
     live AI screening is aligned with the trading bot's signal logic.
     """
     scored = []
-    for symbol, data in indicator_results:
-        rsi = data['rsi']
-        atr = data['atr']
-        volume_ratio = data['volume_ratio']
-        slope = data['slope']
-        gap = data['gap']
-        crossover = data['ema_crossover']
+    for result in indicator_results:
+        symbol = result['symbol']
+        rsi = result['rsi']
+        atr = result['atr']
+        volume_ratio = result['volume_ratio']
+        slope = result['slope']
+        gap = result['gap']
+        crossover = result['ema_crossover']
 
         score_val = unified_ai_score(
             rsi=rsi,
@@ -482,39 +503,23 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
 
     # --- Step 1: compute internal scores (using existing scoring logic) ---
     try:
-        # Use existing stage_a_screen_and_collect to get raw data
-        raw_results = asyncio.run(stage_a_screen_and_collect(mode=mode, limit=50))
+        # Use existing stage_a_screen_and_collect to get scored data
+        scored_results = asyncio.run(stage_a_screen_and_collect(mode=mode, limit=50))
         
-        # Score the results using existing score_tickers function
-        scored_results = []
-        for result in raw_results:
-            score = unified_ai_score(
-                rsi=result.get('rsi'),
-                atr=result.get('atr_pct', 0),
-                ema_crossover=bool(result.get('ema_crossover', False)),
-                volume_ratio=result.get('volume_ratio', 1.0),
-                slope=result.get('slope', 0.0),
-                gap=result.get('gap', 0.0),
-            ) or 0.0
+        # Results are already scored from stage_a_screen_and_collect
+        if not scored_results:
+            logging.warning("No scored results from stage_a_screen_and_collect")
+            return []
             
-            scored_results.append({
-                "symbol": result.get('symbol'),
-                "score": score,
-                "rsi": result.get('rsi'),
-                "atr_pct": result.get('atr_pct'),
-                "macd": result.get('macd', 0),
-                "sentiment": result.get('sentiment', 0),
-                "volume": result.get('volume', 0),
-            })
     except Exception as e:
         logging.error(f"Error computing AI scores: {e}")
         return []
 
-    # Sort by score descending
-    scored_results = sorted(scored_results, key=lambda x: x["score"], reverse=True)[:limit]
+    # Sort by score descending and take top limit
+    scored_sorted = sorted(scored_results, key=lambda x: x["score"], reverse=True)[:limit]
 
     # Add rank field
-    for idx, r in enumerate(scored_results):
+    for idx, r in enumerate(scored_sorted):
         r["rank"] = idx + 1
 
     # --- Step 2: Save results to Supabase so Next.js dashboard can display them ---
@@ -526,19 +531,19 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
                         "user_id": user_id,
                         "mode": mode,
                         "symbol": r["symbol"],
-                        "score": r.get("score"),
-                        "rsi": r.get("rsi"),
-                        "atr_pct": r.get("atr_pct"),
-                        "macd": r.get("macd"),
-                        "sentiment": r.get("sentiment"),
-                        "volume": r.get("volume"),
+                        "score": r["score"],
+                        "rsi": r["rsi"],
+                        "atr_pct": r["atr_pct"],
+                        "macd": r["macd"],
+                        "sentiment": r["sentiment"],
+                        "volume": r["volume"],
                         "rank": r["rank"],
                     }
-                    for r in scored_results
+                    for r in scored_sorted
                 ]
             ).execute()
     except Exception as e:
         print("AI Ticker save error:", e)
 
     # Worker only needs list of symbols
-    return [r["symbol"] for r in scored_results]
+    return [r["symbol"] for r in scored_sorted]

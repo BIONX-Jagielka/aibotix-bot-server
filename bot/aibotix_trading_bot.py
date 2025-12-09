@@ -1,5 +1,9 @@
 # --- BotSession container for state (Patch B foundation) ---
 # --- BotSession container for state (Patch B foundation) ---
+
+# Global client registry for equity snapshots
+_CLIENT_REGISTRY = {}  # key: f"{user_id}:{mode}" → Alpaca TradingClient instance
+
 class BotSession:
     def __init__(self):
         self.USER_ID = None
@@ -210,6 +214,15 @@ def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_
     data_client = StockHistoricalDataClient(api_key, api_secret)
     # ----------------------------------------------------
 
+    # Store clients in registry for equity snapshots
+    key = f"{user_id}:{effective_mode}"
+    _CLIENT_REGISTRY[key] = {
+        "trading_client": api,
+        "data_client": data_client,
+        "user_id": user_id,
+        "mode": effective_mode
+    }
+
     # Attach to session
     session.api = api
     session.data_client = data_client
@@ -223,6 +236,14 @@ def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_
     supabase_log(f"client_initialised | mode={effective_mode} | paper={paper_mode}")
 
     return api
+
+def get_trading_client(user_id: str, mode: str):
+    """
+    Retrieve the stored TradingClient + DataClient for equity snapshots.
+    Returns None if not yet initialized.
+    """
+    key = f"{user_id}:{mode}"
+    return _CLIENT_REGISTRY.get(key)
 
 # Global placeholder. Start/stop routes will set this dynamically.
 api: TradingClient | None = None

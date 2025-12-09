@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64decode
 from supabase import create_client, Client
 
-from bot.aibotix_trading_bot import trade_loop_async
+from bot.aibotix_trading_bot import trade_loop_async, get_trading_client
 
 # --- AI ticker selector imports ---
 from bot.ai_ticker_selector_aibotix import (
@@ -599,14 +599,18 @@ async def worker_loop(poll_interval: int = 10) -> None:
 
                 # Fetch account & save equity every 5 minutes
                 if should_save_equity:
-                    try:
-                        from bot.aibotix_trading_bot import get_trading_client
-                        client = get_trading_client(uid, mode)
-                        if client:
-                            account = await client.get_account()
-                            await save_equity_snapshot(supabase, uid, account)
-                    except Exception as e:
-                        logger.error("Equity snapshot error for user_id=%s mode=%s: %s", uid, mode, e)
+                    client_bundle = get_trading_client(uid, mode)
+                    if client_bundle:
+                        trading_client = client_bundle.get("trading_client")
+                        if trading_client:
+                            try:
+                                account = await trading_client.get_account()
+                                await save_equity_snapshot(supabase, uid, account)
+                            except Exception as e:
+                                logger.error("Failed to fetch account for equity snapshot: %s", e)
+                    else:
+                        # No client yet (likely bot hasn't initialized) — skip silently
+                        pass
 
             # Build the set of keys that *should* be running right now
             active_keys = {

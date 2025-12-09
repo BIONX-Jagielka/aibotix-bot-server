@@ -474,27 +474,71 @@ if __name__ == "__main__":
     log_selected_tickers_for_learning(results)
     top = score_tickers(results, default_mode)
 
-def get_top_tickers(indicator_log_csv='ai_ticker_learning_log.csv', top_n=5):
+def get_top_tickers(limit: int, user_id: str, mode: str):
+    """
+    Returns a ranked list of top tickers AND writes the full scoring detail
+    to the ai_tickers table in Supabase for dashboard display.
+    """
+
+    # --- Step 1: compute internal scores (using existing scoring logic) ---
     try:
-        df = pd.read_csv(indicator_log_csv)
-        df.dropna(subset=['rsi', 'atr'], inplace=True)
-
-        def score(row):
-            return unified_ai_score(
-                rsi=row.get('rsi'),
-                atr=row.get('atr'),
-                ema_crossover=bool(row.get('ema_crossover')),
-                volume_ratio=row.get('volume_ratio', 1.0),
-                slope=row.get('slope', 0.0),
-                gap=row.get('gap', 0.0),
+        # Use existing stage_a_screen_and_collect to get raw data
+        raw_results = asyncio.run(stage_a_screen_and_collect(mode=mode, limit=50))
+        
+        # Score the results using existing score_tickers function
+        scored_results = []
+        for result in raw_results:
+            score = unified_ai_score(
+                rsi=result.get('rsi'),
+                atr=result.get('atr_pct', 0),
+                ema_crossover=bool(result.get('ema_crossover', False)),
+                volume_ratio=result.get('volume_ratio', 1.0),
+                slope=result.get('slope', 0.0),
+                gap=result.get('gap', 0.0),
             ) or 0.0
-
-        df['score'] = df.apply(score, axis=1)
-        top_df = df.sort_values(by='score', ascending=False).head(top_n)
-
-        logging.info(f"Top {top_n} tickers selected: {top_df['symbol'].tolist()}")
-        return top_df['symbol'].tolist()
-
+            
+            scored_results.append({
+                "symbol": result.get('symbol'),
+                "score": score,
+                "rsi": result.get('rsi'),
+                "atr_pct": result.get('atr_pct'),
+                "macd": result.get('macd', 0),
+                "sentiment": result.get('sentiment', 0),
+                "volume": result.get('volume', 0),
+            })
     except Exception as e:
-        logging.error(f"Error in get_top_tickers: {e}")
+        logging.error(f"Error computing AI scores: {e}")
         return []
+
+    # Sort by score descending
+    scored_results = sorted(scored_results, key=lambda x: x["score"], reverse=True)[:limit]
+
+    # Add rank field
+    for idx, r in enumerate(scored_results):
+        r["rank"] = idx + 1
+
+    # --- Step 2: Save results to Supabase so Next.js dashboard can display them ---
+    try:
+        if supabase:
+            supabase.table("ai_tickers").upsert(
+                [
+                    {
+                        "user_id": user_id,
+                        "mode": mode,
+                        "symbol": r["symbol"],
+                        "score": r.get("score"),
+                        "rsi": r.get("rsi"),
+                        "atr_pct": r.get("atr_pct"),
+                        "macd": r.get("macd"),
+                        "sentiment": r.get("sentiment"),
+                        "volume": r.get("volume"),
+                        "rank": r["rank"],
+                    }
+                    for r in scored_results
+                ]
+            ).execute()
+    except Exception as e:
+        print("AI Ticker save error:", e)
+
+    # Worker only needs list of symbols
+    return [r["symbol"] for r in scored_results]

@@ -15,6 +15,7 @@ from bot.ai_ticker_selector_aibotix import (
     stage_a_screen_and_collect,
     score_tickers,
     save_ai_tickers,
+    get_top_tickers,
 )
 
 # ----------------------------------------
@@ -443,8 +444,16 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 ai_tickers = await fetch_ai_tickers(user_id, mode)
             except Exception as e:
                 logger.error("AI selector failed for user_id=%s mode=%s: %s", user_id, mode, e)
-        # Load AI-approved tickers for this user+mode
-        ai_tickers = await fetch_ai_tickers(user_id, mode)
+        
+        # Load AI tickers using the new get_top_tickers function
+        ticker_list = await asyncio.to_thread(
+            get_top_tickers,
+            5,
+            user_id,
+            mode
+        )
+        
+        ai_tickers = ticker_list
 
         if not ai_tickers:
             # Bot is configured to run, but AI hasn't chosen tickers yet.

@@ -604,7 +604,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
                         trading_client = client_bundle.get("trading_client")
                         if trading_client:
                             try:
-                                account = await trading_client.get_account()
+                                account = trading_client.get_account()
                                 await save_equity_snapshot(supabase, uid, account)
                             except Exception as e:
                                 logger.error("Failed to fetch account for equity snapshot: %s", e)

@@ -714,7 +714,7 @@ INDICATOR_WEIGHTS = {
     'Sentiment': 0.2
 }
 # --- Signal thresholds & trade guards ---
-SIGNAL_BUY_THRESHOLD = 0.28   # how strong the combined signal must be to enter
+SIGNAL_BUY_THRESHOLD = 0.20   # how strong the combined signal must be to enter
 SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
 
 # Volatility guard (ignore ultra-quiet or too-wild regimes)
@@ -1183,34 +1183,41 @@ async def process_ticker(ticker):
         # Conservative Entry Logic (Step 2)
 
         # 1. RSI conservative filter (avoid overbought)
-        if not pd.isna(rsi) and rsi > 60:
+        if not pd.isna(rsi) and rsi > 68:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=RSI_TOO_HIGH rsi={rsi:.1f}")
             return
 
         # 2. ATR volatility filter (avoid weak or explosive regimes)
-        if pd.isna(atr_pct) or atr_pct < 0.004 or atr_pct > 0.05:
+        if pd.isna(atr_pct) or atr_pct < 0.0025 or atr_pct > 0.07:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=ATR_RANGE atr_pct={atr_pct:.4f}")
             return
 
-        # 3. MACD confirmation – must be positive and rising
+        # 3. MACD confirmation – must be rising (momentum building)
         prev_macd = float(df['MACD'].iloc[-2]) if len(df) > 1 else macd
-        if macd <= 0 or macd < prev_macd:
+        if macd < prev_macd:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=MACD_FALLING macd={macd:.4f} prev={prev_macd:.4f}")
             return
 
-        # 4. Bollinger Band mid‑band support – avoid chasing upper band
-        if close_price > bb_upper:
+        # 4. Bollinger Band filter – avoid chasing unless momentum is very strong
+        if close_price > bb_upper and rsi > 70:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=BB_UPPER_OVERBOUGHT price={close_price:.2f} bb_upper={bb_upper:.2f} rsi={rsi:.1f}")
             return
 
         # 5. Sentiment must be neutral or positive
         if sentiment < 0:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=NEGATIVE_SENTIMENT sentiment={sentiment:.3f}")
             return
 
         # 6. Score threshold aligned with Smart Exit Logic
-        CONSERVATIVE_ENTRY_THRESHOLD = SIGNAL_BUY_THRESHOLD * 1.15  # slightly stricter than exit threshold
+        CONSERVATIVE_ENTRY_THRESHOLD = SIGNAL_BUY_THRESHOLD * 1.05  # slightly stricter than exit threshold
         if score < CONSERVATIVE_ENTRY_THRESHOLD:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LOW_SCORE score={score:.3f} threshold={CONSERVATIVE_ENTRY_THRESHOLD:.3f}")
             return
 
-        # 7. Trend acceleration – confirm short‑term momentum
+        # 7. Trend acceleration – confirm short‑term momentum (allow flat)
         prev_close = float(df['close'].iloc[-2]) if len(df) > 1 else close_price
-        if close_price <= prev_close:
+        if close_price < prev_close * 0.998:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=WEAK_TREND close={close_price:.2f} prev={prev_close:.2f}")
             return
 
         # 8. Safety checks before entering

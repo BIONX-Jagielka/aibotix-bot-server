@@ -450,10 +450,10 @@ async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
     def _query():
         return (
             supabase.table("ai_tickers")
-            .select("tickers")
+            .select("ticker")
             .eq("user_id", user_id)
             .eq("mode", mode)
-            .limit(1)
+            .order("rank", ascending=True)
             .execute()
         )
 
@@ -470,12 +470,12 @@ async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
             )
             return None
 
-        row = data[0] if isinstance(data, list) else data
-        tickers = row.get("tickers") or []
+        # Build list from individual ticker rows
+        tickers = [row["ticker"] for row in data if row.get("ticker")]
 
         if not tickers:
             logger.info(
-                "AI tickers row exists but empty for user_id=%s mode=%s; waiting.",
+                "AI tickers rows exist but empty for user_id=%s mode=%s; waiting.",
                 user_id,
                 mode,
             )

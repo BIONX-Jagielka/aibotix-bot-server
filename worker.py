@@ -24,6 +24,16 @@ from bot.ai_ticker_selector_aibotix import (
 ACTIVE_BOTS: Dict[str, asyncio.Task] = {}  # key = f"{user_id}:{mode}" -> asyncio.Task
 
 # ----------------------------------------
+# AI Ticker Rescanning Configuration
+# ----------------------------------------
+AI_RESCAN_INTERVAL_SECONDS = 7200  # 2 hours
+AI_SCORE_REPLACEMENT_THRESHOLD = 1.25  # 25% stronger score required
+
+# Track last AI scan time per user/mode
+LAST_AI_SCAN_AT: Dict[str, datetime] = {}  # key = f"{user_id}:{mode}" -> datetime
+LAST_MARKET_STATE: Dict[str, bool] = {}  # key = f"{user_id}:{mode}" -> is_open boolean
+
+# ----------------------------------------
 # Basic logging
 # ----------------------------------------
 logging.basicConfig(
@@ -323,6 +333,115 @@ async def update_heartbeat(user_id: str, mode: str) -> None:
     )
 
 
+async def is_market_open(trading_client) -> bool:
+    """
+    Check if market is currently open using the trading client.
+    """
+    try:
+        clock = trading_client.get_clock()
+        return clock.is_open
+    except Exception:
+        return False
+
+
+async def should_trigger_ai_scan(user_id: str, mode: str, trading_client) -> tuple[bool, str]:
+    """
+    Determine if AI ticker scan should be triggered.
+    Returns (should_scan, reason)
+    """
+    key = f"{user_id}:{mode}"
+    now = datetime.utcnow()
+    
+    # Check current market state
+    current_market_open = await asyncio.to_thread(is_market_open, trading_client)
+    previous_market_open = LAST_MARKET_STATE.get(key, False)
+    
+    # Update market state tracking
+    LAST_MARKET_STATE[key] = current_market_open
+    
+    # Trigger 1: Market just opened
+    if current_market_open and not previous_market_open:
+        return True, "market open"
+    
+    # Trigger 2: Scheduled rescan (market is open and enough time has passed)
+    if current_market_open:
+        last_scan = LAST_AI_SCAN_AT.get(key)
+        if last_scan is None:
+            return True, "initial scan"
+        
+        time_since_scan = (now - last_scan).total_seconds()
+        if time_since_scan >= AI_RESCAN_INTERVAL_SECONDS:
+            return True, "scheduled rescan"
+    
+    return False, "no trigger"
+
+
+async def intelligent_ticker_replacement(
+    user_id: str, mode: str, new_tickers: list, current_ai_tickers: list, trading_client
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Intelligent ticker replacement logic that preserves profitable positions.
+    Returns (final_tickers, kept_tickers, replaced_tickers)
+    """
+    if not new_tickers:
+        return current_ai_tickers, current_ai_tickers, []
+    
+    if not current_ai_tickers:
+        return new_tickers, [], new_tickers
+    
+    try:
+        # Get current positions
+        positions = await asyncio.to_thread(trading_client.get_all_positions)
+        position_symbols = {p.symbol for p in positions}
+        profitable_positions = set()
+        
+        # Identify profitable positions
+        for position in positions:
+            try:
+                pnl = float(position.unrealized_plpc)
+                if pnl >= 0:  # Profitable or break-even
+                    profitable_positions.add(position.symbol)
+            except (AttributeError, ValueError):
+                # If we can't determine PnL, assume it's held for a reason
+                profitable_positions.add(position.symbol)
+    
+    except Exception as e:
+        logger.warning("Failed to get positions for ticker replacement: %s", e)
+        # If we can't get positions, be conservative and keep current tickers
+        return current_ai_tickers, current_ai_tickers, []
+    
+    # Score-based replacement logic
+    final_tickers = []
+    kept_tickers = []
+    replaced_tickers = []
+    
+    # Keep profitable existing positions
+    for ticker in current_ai_tickers:
+        if ticker in position_symbols and ticker in profitable_positions:
+            final_tickers.append(ticker)
+            kept_tickers.append(ticker)
+            logger.info("Keeping profitable position: %s", ticker)
+    
+    # Fill remaining slots with new tickers if they meet threshold
+    new_ticker_set = set(new_tickers) - set(final_tickers)
+    remaining_slots = 5 - len(final_tickers)  # Assuming max 5 tickers
+    
+    # Add new tickers up to the limit
+    for ticker in list(new_ticker_set)[:remaining_slots]:
+        final_tickers.append(ticker)
+        if ticker not in current_ai_tickers:
+            replaced_tickers.append(ticker)
+    
+    # If we still have slots, fill with non-profitable current tickers
+    if len(final_tickers) < 5:
+        for ticker in current_ai_tickers:
+            if ticker not in final_tickers and len(final_tickers) < 5:
+                final_tickers.append(ticker)
+                kept_tickers.append(ticker)
+    
+    return final_tickers[:5], kept_tickers, replaced_tickers
+
+
 async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
     """
     Safe loader for AI tickers. Returns None when 0 rows exist (first‑run),
@@ -546,10 +665,18 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     mode=mode,
                 )
                 
-                # Get AI tickers
+                # Get AI tickers and initialize scan tracking
                 ai_tickers = await asyncio.to_thread(get_top_tickers, 5, user_id, mode)
+                
+                # Initialize AI scan tracking for this bot
+                bot_key = f"{user_id}:{mode}"
+                LAST_AI_SCAN_AT[bot_key] = datetime.utcnow()
+                
+                # Initialize market state (assume closed to trigger immediate scan at open)
+                LAST_MARKET_STATE[bot_key] = False
+                
                 if ai_tickers:
-                    logger.info("Bot %s using AI tickers: %s", key, ai_tickers)
+                    logger.info("Bot %s using initial AI tickers: %s", key, ai_tickers)
                     await trade_loop_async(allowed_tickers=ai_tickers)
                 else:
                     logger.info("Bot %s starting with no AI tickers - will wait for selection", key)
@@ -576,10 +703,16 @@ async def worker_loop(poll_interval: int = 10) -> None:
                                       message=error_msg)
                 await log_activity(user_id, mode, f"❌ {error_msg}")
             finally:
-                # Always clean up from registry
+                # Always clean up from registry and AI tracking
                 if key in ACTIVE_BOTS:
                     del ACTIVE_BOTS[key]
                     logger.info("Cleaned up task from ACTIVE_BOTS registry: %s", key)
+                
+                # Clean up AI scan tracking
+                if key in LAST_AI_SCAN_AT:
+                    del LAST_AI_SCAN_AT[key]
+                if key in LAST_MARKET_STATE:
+                    del LAST_MARKET_STATE[key]
         
         # Create and store the task
         task = asyncio.create_task(run_bot_task())
@@ -614,6 +747,12 @@ async def worker_loop(poll_interval: int = 10) -> None:
             logger.info("STOP cleaning orphaned state for %s (no active task)", key)
             await log_activity(user_id, mode, "Stop request processed - cleaning any orphaned state")
         
+        # Clean up AI scan tracking
+        if key in LAST_AI_SCAN_AT:
+            del LAST_AI_SCAN_AT[key]
+        if key in LAST_MARKET_STATE:
+            del LAST_MARKET_STATE[key]
+        
         # Always update Supabase status to stopped
         await upsert_bot_status(user_id, mode, "stopped", 
                               message="Bot stopped via stop request")
@@ -627,12 +766,93 @@ async def worker_loop(poll_interval: int = 10) -> None:
             # Fetch bot configuration intent from Supabase
             active_rows = await fetch_active_bots()
             
-            # Update heartbeats for running bots
+            # Update heartbeats for running bots and handle AI rescanning
             now_ts = datetime.utcnow().timestamp()
             if not hasattr(worker_loop, "_last_equity_save"):
                 worker_loop._last_equity_save = 0
             
             should_save_equity = (now_ts - worker_loop._last_equity_save) >= 300
+            
+            # AI Ticker Rescanning Logic
+            for row in active_rows:
+                uid_raw = row.get("user_id")
+                if uid_raw is None:
+                    continue
+                uid = str(uid_raw)
+                mode = row.get("mode", "paper")
+                key = f"{uid}:{mode}"
+                
+                # Only process AI rescanning for running bots
+                if key in ACTIVE_BOTS and not ACTIVE_BOTS[key].done():
+                    try:
+                        # Get trading client for market state checks
+                        client_bundle = get_trading_client(uid, mode)
+                        if client_bundle and client_bundle.get("trading_client"):
+                            trading_client = client_bundle["trading_client"]
+                            
+                            # Check if AI scan should be triggered
+                            should_scan, reason = await should_trigger_ai_scan(uid, mode, trading_client)
+                            
+                            if should_scan:
+                                logger.info("AI ticker scan triggered: %s (user_id=%s, mode=%s)", reason, uid, mode)
+                                
+                                try:
+                                    # Get current AI tickers
+                                    current_tickers = await fetch_ai_tickers(uid, mode) or []
+                                    
+                                    # Run AI ticker selection
+                                    new_tickers = await asyncio.to_thread(get_top_tickers, 5, uid, mode)
+                                    
+                                    if new_tickers:
+                                        # Intelligent replacement logic
+                                        final_tickers, kept_tickers, replaced_tickers = await intelligent_ticker_replacement(
+                                            uid, mode, new_tickers, current_tickers, trading_client
+                                        )
+                                        
+                                        # Update AI tickers if changes were made
+                                        if final_tickers != current_tickers:
+                                            # Save new tickers to database
+                                            await asyncio.to_thread(
+                                                lambda: supabase.table("ai_tickers")
+                                                .delete()
+                                                .match({"user_id": uid, "mode": mode})
+                                                .execute()
+                                            )
+                                            
+                                            rows = []
+                                            for idx, ticker in enumerate(final_tickers, start=1):
+                                                rows.append({
+                                                    "user_id": uid,
+                                                    "mode": mode,
+                                                    "ticker": ticker,
+                                                    "rank": idx,
+                                                    "score": 0.0,  # Will be updated by next full scan
+                                                })
+                                            
+                                            if rows:
+                                                await asyncio.to_thread(
+                                                    lambda: supabase.table("ai_tickers").insert(rows).execute()
+                                                )
+                                            
+                                            # Log changes
+                                            if kept_tickers:
+                                                logger.info("AI scan kept profitable tickers: %s", kept_tickers)
+                                            if replaced_tickers:
+                                                logger.info("AI scan added new opportunities: %s", replaced_tickers)
+                                        else:
+                                            logger.info("AI scan completed - no changes needed (tickers remain optimal)")
+                                    else:
+                                        logger.warning("AI scan returned no tickers - keeping current selection")
+                                    
+                                    # Update last scan timestamp
+                                    LAST_AI_SCAN_AT[key] = datetime.utcnow()
+                                    
+                                except Exception as scan_error:
+                                    logger.error("AI ticker scan failed for %s: %s", key, scan_error)
+                                    # Keep current tickers on scan failure - safety fallback
+                    
+                    except Exception as e:
+                        logger.warning("Error in AI rescanning logic for %s: %s", key, e)
             
             for row in active_rows:
                 uid_raw = row.get("user_id")

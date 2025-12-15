@@ -208,7 +208,8 @@ async def upsert_runtime(user_id: str, mode: str, fields: Dict[str, Any]) -> Non
                     "user_id": user_id,
                     "mode": mode,
                     **payload,
-                }
+                },
+                on_conflict="user_id,mode"
             )
             .execute()
         )
@@ -245,40 +246,13 @@ async def upsert_bot_status(user_id: str, mode: str, status: str, **kwargs) -> N
         }
         if "last_error" in kwargs:
             config_payload["last_error"] = kwargs["last_error"]
-        return supabase.table("bots_config").upsert(config_payload).execute()
+        return supabase.table("bots_config").upsert(config_payload, on_conflict="user_id,mode").execute()
     
     try:
         await _run_supabase(_update_config)
         await upsert_runtime(user_id, mode, fields)
     except Exception:
         logger.exception("Failed to update bot status for user_id=%s mode=%s", user_id, mode)
-    """
-    Shared helper to upsert into bot_runtime for a given user+mode.
-    This table stores live runtime metrics (heartbeat, last error, shutdown, status).
-    """
-    def _upsert():
-        payload = {**fields}
-        return (
-            supabase.table("bot_runtime")
-            .upsert(
-                {
-                    "user_id": user_id,
-                    "mode": mode,
-                    **payload,
-                }
-            )
-            .execute()
-        )
-
-    try:
-        await _run_supabase(_upsert)
-    except Exception:
-        logger.exception(
-            "Failed to upsert bot_runtime for user_id=%s mode=%s with %s",
-            user_id,
-            mode,
-            fields,
-        )
 
 
 async def mark_bot_running(user_id: str, mode: str) -> None:

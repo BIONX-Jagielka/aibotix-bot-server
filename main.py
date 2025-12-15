@@ -151,7 +151,7 @@ def upsert_bot_config(
         payload["last_error"] = last_error
 
     # Unique constraint (user_id, mode) ensures one bot per user per mode.
-    supabase.table("bots_config").upsert(payload).execute()
+    supabase.table("bots_config").upsert(payload, on_conflict="user_id,mode").execute()
 
 
 def log_bot_event(user_id: str, mode: str, message: str) -> None:
@@ -461,7 +461,8 @@ async def stop_bot(request: Request):
                             "last_shutdown": utc_now_iso(),
                             "message": "Bot stopped via stop request",
                             "updated_at": utc_now_iso(),
-                        }
+                        },
+                        on_conflict="user_id,mode"
                     )
                     .execute()
                 )

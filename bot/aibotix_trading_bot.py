@@ -794,47 +794,73 @@ def request_bot_stop():
     supabase_log(f"bot_stop_requested @ {datetime.datetime.now(ny_tz).isoformat()}")
     logging.info("Bot stop requested; worker will cancel trade_loop_async task.")
 
+async def wait_until_market_open_or_preopen(preopen_minutes: int = 10):
+    if SESSION.api is None:
+        await asyncio.sleep(60)
+        return "closed"
+
+    clock = await asyncio.to_thread(SESSION.api.get_clock)
+
+    if clock.is_open:
+        return "open"
+
+    now = clock.timestamp
+    next_open = clock.next_open
+    seconds_to_open = max((next_open - now).total_seconds(), 0)
+
+    if seconds_to_open > preopen_minutes * 60:
+        sleep_for = seconds_to_open - (preopen_minutes * 60)
+        logging.info(f"Market closed. Sleeping until pre-open window ({int(sleep_for)}s).")
+        await asyncio.sleep(sleep_for)
+        return "preopen"
+
+    logging.info("Pre-open window reached. Waiting for market open.")
+    await asyncio.sleep(max(seconds_to_open, 1))
+    return "open"
+
 async def trade_loop_async(allowed_tickers=None):
     # Ensure correct session context
     get_session(SESSION.USER_ID, SESSION.CURRENT_MODE)
     if allowed_tickers is not None:
         # Override AI-selected tickers
         SESSION.TICKERS = list(allowed_tickers)
-    # Fetch initial tickers using the AI ticker selector with retry logic, only when market is open
+    
+    # Market-aware startup: instant wake-up
     while True:
-        if not await is_market_open_async():
-            logging.info("Market is currently closed. Waiting for market to open before fetching tickers...")
-            await asyncio.sleep(300)
-            continue
-        # Wait for AI Ticker Selector to return tickers with retries
-        max_attempts = 5
-        retry_delay = 60  # seconds
+        state = await wait_until_market_open_or_preopen()
 
-        for attempt in range(1, max_attempts + 1):
-            if allowed_tickers is not None:
-                selected_tickers = list(allowed_tickers)
-            else:
-                selected_tickers = await asyncio.to_thread(
-                    get_top_tickers,
-                    5,
-                    SESSION.USER_ID,
-                    SESSION.CURRENT_MODE
-                )
+        if state == "preopen":
+            logging.info("Pre-open phase: running AI ticker selector early.")
+            selected_tickers = await asyncio.to_thread(
+                get_top_tickers,
+                5,
+                SESSION.USER_ID,
+                SESSION.CURRENT_MODE
+            )
             if selected_tickers:
-                logging.info(f"Top tickers received: {selected_tickers}")
-                break
-            else:
-                logging.info(f"Waiting for AI ticker selector... (attempt {attempt}/{max_attempts})")
-                await asyncio.sleep(retry_delay)
-        else:
-            logging.error("AI Ticker Selector failed to return tickers after multiple attempts. Exiting trading loop.")
-            continue  # try again on next cycle
+                SESSION.TICKERS = list(selected_tickers)
+                SESSION.ACTIVE_TICKERS = list(selected_tickers)
+                logging.info(f"Pre-open AI tickers prepared: {SESSION.TICKERS}")
+            continue
 
-        SESSION.TICKERS = selected_tickers
-        if SESSION.TICKERS:
+        if state == "open":
+            logging.info("Market open detected — entering trading loop immediately.")
             break
+    
+    # Ensure we have tickers if not set during pre-open
+    if not SESSION.TICKERS and allowed_tickers is None:
+        selected_tickers = await asyncio.to_thread(
+            get_top_tickers,
+            5,
+            SESSION.USER_ID,
+            SESSION.CURRENT_MODE
+        )
+        if selected_tickers:
+            SESSION.TICKERS = list(selected_tickers)
+            SESSION.ACTIVE_TICKERS = list(selected_tickers)
+            logging.info(f"Market-open AI tickers loaded: {SESSION.TICKERS}")
 
-    logging.info(f"Selected tickers for trading: {SESSION.TICKERS}")
+    logging.info(f"Trading loop active with tickers: {SESSION.TICKERS}")
     last_ticker_refresh = ny_now()
     while True:
         try:
@@ -962,8 +988,8 @@ async def trade_loop_async(allowed_tickers=None):
                     last_ticker_refresh = now
 
             if not await is_market_open_async():
-                logging.info("Market closed. Sleeping 5 mins...")
-                await asyncio.sleep(300)
+                logging.info("Market closed. Waiting until next open...")
+                await wait_until_market_open_or_preopen()
                 continue
 
             # Check if market is about to close (non-blocking API call)
@@ -978,7 +1004,8 @@ async def trade_loop_async(allowed_tickers=None):
                 if time_to_close is not None and time_to_close < datetime.timedelta(minutes=15):
                     logging.info("Market is about to close. Closing all positions.")
                     await close_all_positions()
-                    await asyncio.sleep(900)  # Wait until market reopens
+                    logging.info("Waiting until next market open...")
+                    await wait_until_market_open_or_preopen()
                     continue
 
             # Track P&L without blocking the event loop
@@ -1004,13 +1031,14 @@ async def trade_loop_async(allowed_tickers=None):
 
             hour_start = ny_now()
 
-            if not SESSION.TICKERS:
-                logging.warning("SESSION.TICKERS empty. Waiting 60s...")
+            if not SESSION.TICKERS and not SESSION.ACTIVE_TICKERS:
+                logging.warning("Both SESSION.TICKERS and SESSION.ACTIVE_TICKERS empty. Waiting 60s...")
                 await asyncio.sleep(60)
                 continue
 
             tasks = []
-            for ticker in SESSION.ACTIVE_TICKERS:
+            tickers_to_process = SESSION.ACTIVE_TICKERS or SESSION.TICKERS
+            for ticker in tickers_to_process:
                 if not await is_market_open_async(ticker):
                     continue
 

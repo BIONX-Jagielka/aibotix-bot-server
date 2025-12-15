@@ -123,17 +123,27 @@ def upsert_bot_config(
     is_running: bool,
     strategy_id: str = "default_rsi",
     last_error: Optional[str] = None,
+    status: Optional[str] = None,
 ) -> None:
     """
     Single source of truth for bot state, stored in bots_config.
-
+    
     Worker processes watch this table and start/stop per-user bots accordingly.
+    Status field enforces: "running" | "stopped" | "error"
     """
+    # Determine status from is_running if not explicitly provided
+    if status is None:
+        if last_error:
+            status = "error"
+        else:
+            status = "running" if is_running else "stopped"
+    
     payload: dict = {
         "user_id": user_id,
         "mode": mode,
         "strategy_id": strategy_id,
         "is_running": is_running,
+        "status": status,
         "updated_at": utc_now_iso(),
     }
 
@@ -209,13 +219,15 @@ async def get_status(user_id: Optional[str] = None, mode: Optional[str] = None):
                     "last_error": None,
                 }
 
-            row = resp.data[0]
-            return {
-                "mode": mode,
-                "is_running": bool(row.get("is_running")),
-                "updated_at": row.get("updated_at", utc_now_iso()),
-                "last_error": row.get("last_error"),
-            }
+            if resp.data:
+                row = resp.data[0]
+                return {
+                    "mode": mode,
+                    "is_running": bool(row.get("is_running")),
+                    "status": row.get("status", "unknown"),
+                    "updated_at": row.get("updated_at", utc_now_iso()),
+                    "last_error": row.get("last_error"),
+                }
         except Exception as e:
             print(f"Error fetching {mode} status:", e)
             return {
@@ -289,12 +301,14 @@ async def get_status(user_id: Optional[str] = None, mode: Optional[str] = None):
 @app.post("/api/start")
 async def start_bot(request: Request):
     """
-    Mark a bot as running for a specific user + mode.
-
-    - Validates user_id and mode.
-    - Ensures Alpaca keys exist (so the worker will be able to trade).
-    - Optionally runs AI ticker selector for logging/preview.
-    - Updates bots_config so worker will start or keep the bot running.
+    Mark a bot as running for a specific user + mode with idempotent logic.
+    
+    IDEMPOTENT RULES:
+    - Always check current state first
+    - If already running -> return success without changes
+    - If Supabase says running BUT worker will start fresh -> SUCCESS
+    - Supabase represents INTENT, not proof of execution
+    - START always succeeds if requirements are met
     """
     body = await request.json()
     user_id: Optional[str] = body.get("user_id")
@@ -307,11 +321,48 @@ async def start_bot(request: Request):
     if mode not in ("paper", "live"):
         return {"error": "Invalid mode. Expected 'paper' or 'live'."}
 
+    # Check current state (but don't block on it)
+    try:
+        resp = (
+            supabase.table("bots_config")
+            .select("is_running, status, last_error")
+            .eq("user_id", user_id)
+            .eq("mode", mode)
+            .limit(1)
+            .execute()
+        )
+        
+        if resp.data:
+            current = resp.data[0]
+            if current.get("is_running") and current.get("status") == "running":
+                log_bot_event(user_id, mode, "✅ Start request - bot already running")
+                return {
+                    "message": f"{mode.capitalize()} bot is already running.",
+                    "mode": mode,
+                    "user_id": user_id,
+                    "already_running": True,
+                }
+            elif current.get("is_running") and current.get("status") != "running":
+                log_bot_event(user_id, mode, "✅ Start overriding stale state - fresh start")
+        
+    except Exception as e:
+        # Don't let status checks block startup
+        print(f"[{mode.upper()}] Warning: Could not check current state for user {user_id}: {e}")
+
     # Ensure API keys exist for this user+mode before we mark bot as running
     creds = get_alpaca_keys(user_id, mode)
     if creds is None:
         msg = "No Alpaca API keys found for this user and mode."
         log_bot_event(user_id, mode, f"❌ {msg}")
+        # Update config to show error but don't mark as running
+        upsert_bot_config(
+            user_id=user_id,
+            mode=mode,
+            is_running=False,
+            strategy_id=strategy_id,
+            last_error=msg,
+            status="error",
+        )
         return {"error": msg}
 
     # Optional: run AI ticker selector for logging / preview.
@@ -351,8 +402,9 @@ async def start_bot(request: Request):
             is_running=True,
             strategy_id=strategy_id,
             last_error=None,
+            status="running",
         )
-        log_bot_event(user_id, mode, "✅ Bot start requested.")
+        log_bot_event(user_id, mode, "✅ Bot start requested - worker will ensure task is running")
     except Exception as e:
         print(f"[{mode.upper()}] Failed to update bots_config on start for user {user_id}: {e}")
         return {"error": "Failed to mark bot as running. Please try again."}
@@ -361,15 +413,21 @@ async def start_bot(request: Request):
         "message": f"{mode.capitalize()} bot start requested for user.",
         "mode": mode,
         "user_id": user_id,
+        "idempotent": True,
     }
 
 
 @app.post("/api/stop")
 async def stop_bot(request: Request):
     """
-    Mark a bot as stopped for a specific user + mode.
-
-    Worker will see is_running = false and gracefully wind down the loop.
+    Mark a bot as stopped for a specific user + mode with idempotent logic.
+    
+    IDEMPOTENT RULES:
+    - STOP always succeeds and cleans up state
+    - Updates both bots_config and bot_runtime consistently
+    - Never blocks future START calls
+    - Always logs the stop event
+    - Handles orphaned state gracefully
     """
     body = await request.json()
     user_id: Optional[str] = body.get("user_id")
@@ -382,20 +440,54 @@ async def stop_bot(request: Request):
         return {"error": "Invalid mode. Expected 'paper' or 'live'."}
 
     try:
+        # Always update bots_config to stopped
         upsert_bot_config(
             user_id=user_id,
             mode=mode,
             is_running=False,
+            status="stopped",
         )
-        log_bot_event(user_id, mode, "🛑 Bot stop requested.")
+        
+        # Also update bot_runtime for consistency
+        try:
+            def _update_runtime():
+                return (
+                    supabase.table("bot_runtime")
+                    .upsert(
+                        {
+                            "user_id": user_id,
+                            "mode": mode,
+                            "status": "stopped",
+                            "last_shutdown": utc_now_iso(),
+                            "message": "Bot stopped via stop request",
+                            "updated_at": utc_now_iso(),
+                        }
+                    )
+                    .execute()
+                )
+            _update_runtime()
+        except Exception as runtime_error:
+            # Don't let runtime table errors block the stop operation
+            print(f"[{mode.upper()}] Warning: Could not update bot_runtime: {runtime_error}")
+        
+        log_bot_event(user_id, mode, "🛑 Bot stop requested - worker will clean up any running tasks")
+        
         return {
             "message": f"{mode.capitalize()} bot stop requested for user.",
             "mode": mode,
             "user_id": user_id,
+            "idempotent": True,
         }
     except Exception as e:
-        print(f"[{mode.upper()}] Failed to update bots_config on stop for user {user_id}: {e}")
-        return {"error": "Failed to stop bot. Please try again."}
+        # Even if database operations fail, we should indicate stop was attempted
+        print(f"[{mode.upper()}] Error during stop for user {user_id}: {e}")
+        log_bot_event(user_id, mode, f"⚠️ Stop request error but worker will clean up: {e}")
+        return {
+            "message": f"{mode.capitalize()} bot stop attempted (with errors).",
+            "mode": mode,
+            "user_id": user_id,
+            "warning": "Database update failed but worker will clean up running tasks",
+        }
 
 
 # --------------------------------------------------------------------

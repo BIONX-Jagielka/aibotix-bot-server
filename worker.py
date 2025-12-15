@@ -19,6 +19,11 @@ from bot.ai_ticker_selector_aibotix import (
 )
 
 # ----------------------------------------
+# Global in-memory bot registry
+# ----------------------------------------
+ACTIVE_BOTS: Dict[str, asyncio.Task] = {}  # key = f"{user_id}:{mode}" -> asyncio.Task
+
+# ----------------------------------------
 # Basic logging
 # ----------------------------------------
 logging.basicConfig(
@@ -180,6 +185,63 @@ async def log_activity(user_id: str, mode: str, message: str) -> None:
 
 
 async def upsert_runtime(user_id: str, mode: str, fields: Dict[str, Any]) -> None:
+    """
+    Shared helper to upsert into bot_runtime for a given user+mode.
+    This table stores live runtime metrics (heartbeat, last error, shutdown, status).
+    """
+    def _upsert():
+        payload = {**fields}
+        return (
+            supabase.table("bot_runtime")
+            .upsert(
+                {
+                    "user_id": user_id,
+                    "mode": mode,
+                    **payload,
+                }
+            )
+            .execute()
+        )
+
+    try:
+        await _run_supabase(_upsert)
+    except Exception:
+        logger.exception(
+            "Failed to upsert bot_runtime for user_id=%s mode=%s with %s",
+            user_id,
+            mode,
+            fields,
+        )
+
+
+async def upsert_bot_status(user_id: str, mode: str, status: str, **kwargs) -> None:
+    """
+    Helper to update bot status with consistent field names.
+    Status values: "running" | "stopped" | "error"
+    """
+    fields = {
+        "status": status,
+        "updated_at": utc_now_iso(),
+        **kwargs
+    }
+    
+    # Also update bots_config table for consistency
+    def _update_config():
+        config_payload = {
+            "user_id": user_id,
+            "mode": mode,
+            "is_running": status == "running",
+            "updated_at": utc_now_iso(),
+        }
+        if "last_error" in kwargs:
+            config_payload["last_error"] = kwargs["last_error"]
+        return supabase.table("bots_config").upsert(config_payload).execute()
+    
+    try:
+        await _run_supabase(_update_config)
+        await upsert_runtime(user_id, mode, fields)
+    except Exception:
+        logger.exception("Failed to update bot status for user_id=%s mode=%s", user_id, mode)
     """
     Shared helper to upsert into bot_runtime for a given user+mode.
     This table stores live runtime metrics (heartbeat, last error, shutdown, status).
@@ -391,141 +453,91 @@ async def save_equity_snapshot(supabase, user_id: str, account):
 # ----------------------------------------
 async def worker_loop(poll_interval: int = 10) -> None:
     """
-    Long-running worker that:
-      - polls bots_config for all rows with is_running = true
-      - for each (user_id, mode) ensures a trading task exists
-      - gets per-user Alpaca keys from alpaca_keys
-      - decrypts secrets with AES-256-GCM
-      - uses AI tickers if available; otherwise marks bot as idle/waiting
-      - stops tasks when is_running becomes false
-
-    This loop MUST NEVER exit on normal errors so Render thinks it's healthy.
+    Long-running worker with robust bot start/stop state management.
+    
+    GOAL: Make bot START and STOP idempotent and reliable even if Supabase 
+    contains stale records or the worker restarts.
+    
+    RULES:
+    - ACTIVE_BOTS registry is the source of truth for running tasks
+    - Supabase represents INTENT, not proof of execution
+    - START always works if not already running
+    - STOP always works and cleans up state
+    - No manual database cleanup required
     """
-    logger.info("🔁 AIBOTIX worker loop started (multi-user, multi-bot)")
+    logger.info("🔁 AIBOTIX worker loop started (robust state management)")
+    
+    # On startup, ACTIVE_BOTS starts empty - no auto-start from stale Supabase records
+    logger.info("Worker startup: ACTIVE_BOTS registry initialized empty")
 
-    # task_key -> asyncio.Task
-    bot_tasks: Dict[str, asyncio.Task] = {}
-
-    async def ensure_bot_task(bot_row: Dict[str, Any]) -> None:
+    async def start_bot_task(user_id: str, mode: str, strategy_id: str = "default_rsi") -> bool:
         """
-        Ensure there is a running trading task for this bot (user_id+mode),
-        but only if AI tickers exist. If no AI tickers yet, we mark the bot
-        as idle/waiting and do NOT start trade_loop_async yet.
+        Start a bot task with idempotent logic.
+        Returns True if started/already running, False if failed.
         """
-        user_id_raw = bot_row.get("user_id")
-        if user_id_raw is None:
-            logger.warning("bots_config row missing user_id: %s", bot_row)
-            return
-
-        # In Supabase, user_id is uuid; we always treat as string in Python.
-        user_id = str(user_id_raw)
-        mode = bot_row.get("mode", "paper")
-        strategy_id = bot_row.get("strategy_id", "default_rsi")
-
-        task_key = f"{user_id}:{mode}"
-
-        existing = bot_tasks.get(task_key)
-        if existing and not existing.done():
-            # Task already running for this user+mode
-            return
-
-        # --- AI Ticker Auto‑Generation Step ---
-        # Attempt to generate AI tickers if none exist yet
-        existing_ai = await fetch_ai_tickers(user_id, mode)
-        if not existing_ai:
-            try:
-                raw_scan = await stage_a_screen_and_collect(mode=mode)
-                scored = score_tickers(raw_scan, mode=mode)
-                await asyncio.to_thread(save_ai_tickers, user_id, mode, scored)
-                logger.info("AI tickers generated for user_id=%s mode=%s: %s", user_id, mode, scored)
-                
-                # Force refresh to start bot instantly
-                await asyncio.sleep(0.2)
-                ai_tickers = await fetch_ai_tickers(user_id, mode)
-            except Exception as e:
-                logger.error("AI selector failed for user_id=%s mode=%s: %s", user_id, mode, e)
+        key = f"{user_id}:{mode}"
         
-        # Load AI tickers using the new get_top_tickers function
-        ticker_list = await asyncio.to_thread(
-            get_top_tickers,
-            5,
-            user_id,
-            mode
-        )
+        # Check if task already exists and is running
+        if key in ACTIVE_BOTS:
+            task = ACTIVE_BOTS[key]
+            if not task.done():
+                logger.info("START ignored: bot already running for %s", key)
+                await log_activity(user_id, mode, "Start request ignored - bot already running")
+                return True
+            else:
+                # Task exists but is done - clean it up
+                logger.info("Cleaning up completed task for %s", key)
+                del ACTIVE_BOTS[key]
         
-        ai_tickers = ticker_list
-
-        if not ai_tickers:
-            # Bot is configured to run, but AI hasn't chosen tickers yet.
-            msg = "Bot started, waiting for AI to choose the best tickers to trade"
-            logger.info("%s (user_id=%s, mode=%s)", msg, user_id, mode)
-
-            # Clear previous errors
-            await clear_bot_error(user_id, mode)
-
-            # Mark bot as idle/waiting in runtime
-            await upsert_runtime(
-                user_id,
-                mode,
-                {
-                    "last_heartbeat": utc_now_iso(),
-                    "status": "idle_waiting",
-                    "message": msg,
-                    "last_error": None,
-                    "last_shutdown": None,
-                },
-            )
-
-            # Log for UI
-            await log_activity(user_id, mode, msg)
-
-            # Do NOT start trade_loop_async yet; we will re-check AI tickers
-            # on the next poll iteration.
-            return
-
-        # If we reach here, AI tickers exist – we can start the trading bot.
+        # Check for stale Supabase state and override
+        try:
+            resp = await _run_supabase(lambda: (
+                supabase.table("bot_runtime")
+                .select("status")
+                .eq("user_id", user_id)
+                .eq("mode", mode)
+                .limit(1)
+                .execute()
+            ))
+            
+            if resp.data and resp.data[0].get("status") == "running":
+                logger.info("START overriding stale Supabase state for %s", key)
+                await log_activity(user_id, mode, "Overriding stale database state - starting fresh bot")
+        except Exception:
+            pass  # Don't let status checks block startup
+        
+        # Fetch API keys
+        creds = await fetch_alpaca_keys(user_id, mode)
+        if not creds:
+            error_msg = "Missing Alpaca API keys; cannot start bot"
+            logger.error("%s for %s", error_msg, key)
+            await upsert_bot_status(user_id, mode, "error", last_error=error_msg, message=error_msg)
+            await log_activity(user_id, mode, f"❌ {error_msg}")
+            return False
+        
+        api_key = creds["api_key"]
+        api_secret_enc = creds["api_secret_enc"]
+        api_secret = decrypt_secret(api_secret_enc)
+        
+        if not api_secret:
+            error_msg = "Failed to decrypt Alpaca API secret"
+            logger.error("%s for %s", error_msg, key)
+            await upsert_bot_status(user_id, mode, "error", last_error=error_msg, message=error_msg)
+            await log_activity(user_id, mode, f"❌ {error_msg}")
+            return False
+        
+        # Create bot task
         async def run_bot_task() -> None:
-            # 1) Fetch API keys for this user+mode
-            creds = await fetch_alpaca_keys(user_id, mode)
-            if not creds:
-                msg = "Missing Alpaca API keys; please configure credentials"
-                logger.error("%s (user_id=%s, mode=%s)", msg, user_id, mode)
-                await update_bot_error(user_id, mode, msg)
-                # Reflect error in runtime as well
-                await mark_bot_stopped(user_id, mode, error=msg, message=msg)
-                return
-
-            api_key = creds["api_key"]
-            api_secret_enc = creds["api_secret_enc"]
-            api_secret = decrypt_secret(api_secret_enc)
-
-            if not api_secret:
-                msg = "Failed to decrypt Alpaca API secret"
-                logger.error("%s (user_id=%s, mode=%s)", msg, user_id, mode)
-                await update_bot_error(user_id, mode, msg)
-                await mark_bot_stopped(user_id, mode, error=msg, message=msg)
-                return
-
-            # Clear previous config error and mark status as running
-            await clear_bot_error(user_id, mode)
-            await mark_bot_running(user_id, mode)
-            await log_activity(
-                user_id,
-                mode,
-                f"Bot starting (strategy={strategy_id}, tickers={','.join(ai_tickers)})",
-            )
-
             try:
-                logger.info(
-                    "▶️ Starting bot for user_id=%s, mode=%s, strategy=%s, tickers=%s",
-                    user_id,
-                    mode,
-                    strategy_id,
-                    ai_tickers,
-                )
-                # Initialize trading client with session data
+                logger.info("▶️ Starting bot task for %s", key)
+                await upsert_bot_status(user_id, mode, "running", 
+                                      last_error=None, 
+                                      last_heartbeat=utc_now_iso(),
+                                      message="Bot running normally")
+                await log_activity(user_id, mode, f"✅ Bot started (strategy={strategy_id})")
+                
+                # Initialize trading client
                 from bot.aibotix_trading_bot import init_trading_client
-
                 init_trading_client(
                     api_key=api_key,
                     api_secret=api_secret,
@@ -533,80 +545,108 @@ async def worker_loop(poll_interval: int = 10) -> None:
                     user_id=user_id,
                     mode=mode,
                 )
-
-                # Long-lived trading loop:
-                await trade_loop_async(allowed_tickers=ai_tickers)
-
-                # If trade_loop_async ever returns normally, mark as stopped (no error)
-                await log_activity(user_id, mode, "trade_loop_async finished normally")
-                await mark_bot_stopped(
-                    user_id,
-                    mode,
-                    message="trade_loop_async finished normally",
-                )
-                logger.info(
-                    "✅ trade_loop_async finished for user_id=%s, mode=%s (strategy=%s)",
-                    user_id,
-                    mode,
-                    strategy_id,
-                )
+                
+                # Get AI tickers
+                ai_tickers = await asyncio.to_thread(get_top_tickers, 5, user_id, mode)
+                if ai_tickers:
+                    logger.info("Bot %s using AI tickers: %s", key, ai_tickers)
+                    await trade_loop_async(allowed_tickers=ai_tickers)
+                else:
+                    logger.info("Bot %s starting with no AI tickers - will wait for selection", key)
+                    await trade_loop_async()
+                
+                # Normal completion
+                logger.info("✅ Bot task completed normally for %s", key)
+                await upsert_bot_status(user_id, mode, "stopped", 
+                                      message="Bot completed normally")
+                await log_activity(user_id, mode, "Bot completed trading loop normally")
+                
             except asyncio.CancelledError:
-                await log_activity(user_id, mode, "Bot task cancelled")
-                # Mark as stopped without an error – user likely toggled is_running off
-                await mark_bot_stopped(
-                    user_id,
-                    mode,
-                    message="Bot task cancelled via is_running toggle",
-                )
-                logger.info("⏹ Bot task cancelled for %s", task_key)
+                logger.info("⏹ Bot task cancelled for %s", key)
+                await upsert_bot_status(user_id, mode, "stopped", 
+                                      message="Bot stopped via stop request")
+                await log_activity(user_id, mode, "🛑 Bot stopped via stop request")
                 raise
+                
             except Exception as e:
-                crash_msg = f"Bot crashed: {e!r}"
-                await log_activity(user_id, mode, crash_msg)
-                logger.exception(
-                    "Bot crashed for %s (user_id=%s, mode=%s): %s",
-                    task_key,
-                    user_id,
-                    mode,
-                    e,
-                )
-                await update_bot_error(user_id, mode, crash_msg)
-                # Mark shutdown and persist error for UI indicator
+                error_msg = f"Bot crashed: {e!r}"
+                logger.exception("Bot crashed for %s: %s", key, e)
+                await upsert_bot_status(user_id, mode, "error", 
+                                      last_error=error_msg, 
+                                      message=error_msg)
+                await log_activity(user_id, mode, f"❌ {error_msg}")
+            finally:
+                # Always clean up from registry
+                if key in ACTIVE_BOTS:
+                    del ACTIVE_BOTS[key]
+                    logger.info("Cleaned up task from ACTIVE_BOTS registry: %s", key)
+        
+        # Create and store the task
+        task = asyncio.create_task(run_bot_task())
+        ACTIVE_BOTS[key] = task
+        
+        logger.info("Started new bot task for %s", key)
+        return True
+    
+    async def stop_bot_task(user_id: str, mode: str) -> bool:
+        """
+        Stop a bot task with idempotent logic.
+        Returns True always (STOP never blocks future START calls).
+        """
+        key = f"{user_id}:{mode}"
+        
+        # Cancel task if it exists
+        if key in ACTIVE_BOTS:
+            task = ACTIVE_BOTS[key]
+            if not task.done():
+                logger.info("STOP cancelling running task for %s", key)
+                task.cancel()
                 try:
-                    await mark_bot_stopped(user_id, mode, error=crash_msg, message=crash_msg)
-                except Exception:
-                    logger.exception(
-                        "Failed to mark shutdown in bot_runtime for user_id=%s mode=%s",
-                        user_id,
-                        mode,
-                    )
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Remove from registry
+            del ACTIVE_BOTS[key]
+            logger.info("STOP removed task from registry: %s", key)
+            await log_activity(user_id, mode, "Task cancelled and cleaned from registry")
+        else:
+            logger.info("STOP cleaning orphaned state for %s (no active task)", key)
+            await log_activity(user_id, mode, "Stop request processed - cleaning any orphaned state")
+        
+        # Always update Supabase status to stopped
+        await upsert_bot_status(user_id, mode, "stopped", 
+                              message="Bot stopped via stop request")
+        
+        logger.info("STOP completed for %s", key)
+        return True
 
-        # Create and track the new task
-        bot_tasks[task_key] = asyncio.create_task(run_bot_task())
-
-    # Main supervisor loop – NEVER exits on normal errors
+    # Main supervisor loop
     while True:
         try:
+            # Fetch bot configuration intent from Supabase
             active_rows = await fetch_active_bots()
-
-            # Equity snapshot throttling
+            
+            # Update heartbeats for running bots
             now_ts = datetime.utcnow().timestamp()
             if not hasattr(worker_loop, "_last_equity_save"):
                 worker_loop._last_equity_save = 0
-
+            
             should_save_equity = (now_ts - worker_loop._last_equity_save) >= 300
-
-            # Update heartbeat for all active bots in bot_runtime,
-            # whether or not AI tickers exist yet.
+            
             for row in active_rows:
                 uid_raw = row.get("user_id")
                 if uid_raw is None:
                     continue
                 uid = str(uid_raw)
                 mode = row.get("mode", "paper")
-                await update_heartbeat(uid, mode)
-
-                # Fetch account & save equity every 5 minutes
+                key = f"{uid}:{mode}"
+                
+                # Update heartbeat if task is actually running
+                if key in ACTIVE_BOTS and not ACTIVE_BOTS[key].done():
+                    await update_heartbeat(uid, mode)
+                
+                # Equity snapshots
                 if should_save_equity:
                     client_bundle = get_trading_client(uid, mode)
                     if client_bundle:
@@ -617,41 +657,41 @@ async def worker_loop(poll_interval: int = 10) -> None:
                                 await save_equity_snapshot(supabase, uid, account)
                             except Exception as e:
                                 logger.error("Failed to fetch account for equity snapshot: %s", e)
-                    else:
-                        # No client yet (likely bot hasn't initialized) — skip silently
-                        pass
-
-            # Build the set of keys that *should* be running right now
-            active_keys = {
+            
+            # Determine which bots should be running (START logic)
+            intended_running = {
                 f"{str(r.get('user_id'))}:{r.get('mode', 'paper')}"
                 for r in active_rows
                 if r.get("user_id") is not None
             }
-
-            # Ensure tasks exist for each active bot (if AI tickers exist)
+            
+            # Start tasks for bots that should be running but aren't
             for row in active_rows:
-                await ensure_bot_task(row)
-
-            # Cancel tasks that are no longer active in bots_config
-            for key, task in list(bot_tasks.items()):
-                if key not in active_keys:
-                    logger.info("🛑 Stopping bot for %s (is_running flag turned off)", key)
+                uid_raw = row.get("user_id")
+                if uid_raw is None:
+                    continue
+                uid = str(uid_raw)
+                mode = row.get("mode", "paper")
+                strategy_id = row.get("strategy_id", "default_rsi")
+                key = f"{uid}:{mode}"
+                
+                if key not in ACTIVE_BOTS or ACTIVE_BOTS[key].done():
+                    logger.info("Starting bot for %s (requested via is_running=true)", key)
+                    await start_bot_task(uid, mode, strategy_id)
+            
+            # Stop tasks that are no longer intended to run (STOP logic)
+            for key in list(ACTIVE_BOTS.keys()):
+                if key not in intended_running:
                     uid, mode = key.split(":", 1)
-                    await log_activity(uid, mode, "Bot stopping due to is_running=False")
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    del bot_tasks[key]
-
+                    logger.info("Stopping bot for %s (is_running=false detected)", key)
+                    await stop_bot_task(uid, mode)
+            
             if should_save_equity:
                 worker_loop._last_equity_save = now_ts
-
+        
         except Exception:
-            # We NEVER let an exception break the worker – just log and continue
             logger.exception("Worker loop iteration failed")
-
+        
         await asyncio.sleep(poll_interval)
 
 

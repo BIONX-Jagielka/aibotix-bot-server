@@ -490,24 +490,29 @@ def place_order(symbol, qty, side):
             except Exception as _e:
                 logging.warning(f"{symbol}: could not compute ATR for bracket; falling back to market-only. {_e}")
 
+        # Detect fractional quantity to determine correct TimeInForce
+        qty_float = float(qty)
+        is_fractional = not qty_float.is_integer()
+        time_in_force = TimeInForce.DAY if is_fractional else TimeInForce.GTC
+
         # Build order (use OCO TP/SL when enabled and ATR available)
         if BRACKET_ORDERS_ENABLED and side.lower() == 'buy' and current_price is not None and atr_for_bracket:
             tp_price = round(current_price + (TAKE_PROFIT_ATR_MULT * atr_for_bracket), 2)
             sl_price = round(current_price - (STOP_LOSS_ATR_MULT * atr_for_bracket), 2)
             order = MarketOrderRequest(
                 symbol=symbol,
-                qty=float(qty),
+                qty=qty_float,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=time_in_force,
                 take_profit=TakeProfitRequest(limit_price=tp_price),
                 stop_loss=StopLossRequest(stop_price=sl_price),
             )
         else:
             order = MarketOrderRequest(
                 symbol=symbol,
-                qty=float(qty),  # Alpaca supports fractional qty for eligible assets
+                qty=qty_float,  # Alpaca supports fractional qty for eligible assets
                 side=OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=time_in_force,
             )
 
         SESSION.api.submit_order(order)

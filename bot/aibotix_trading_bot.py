@@ -20,6 +20,10 @@ class BotSession:
         self.start_of_day_equity = None
         self.daily_realized_pnl = 0.0
         self.trading_halted_until = None
+        # Market/session tracking for smarter entries
+        self.market_open_ts = None          # datetime in NY tz for today's market open
+        self.first_trade_done = False       # first entry after market open
+        self.last_market_open_date = None   # date() in NY tz to reset first_trade_done daily
 
         # Per-ticker tracking
         self.per_ticker_loss_streak = {}
@@ -730,6 +734,18 @@ MAX_ATR_PCT = 0.08    # 8% of price
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
 MIN_BARS_REQUIRED = max(RSI_PERIOD + 5, 50)  # ensure enough data for indicators
 
+# === Trade activity tuning (safe) ===
+MVT_ENABLED = True
+MVT_MIN_SCORE = 0.18                  # allow "good enough" setups when momentum/trend confirm
+MVT_RSI_MIN = 42
+MVT_RSI_MAX = 62
+MVT_MIN_ATR_PCT = 0.0015              # 0.15% ATR% minimum for MVT
+MVT_MINUTES_AFTER_OPEN = 15           # don't MVT in the very first minutes
+FIRST_TRADE_BIAS_ENABLED = True
+FIRST_TRADE_BIAS_WINDOW_MIN = 60      # only applies for first entry within first hour
+FIRST_TRADE_SCORE_RELAX = 0.02        # reduce threshold by 0.02 for first trade only
+FIRST_TRADE_RSI_MAX = 70              # allow a slightly higher RSI for first trade only
+
 # Position sizing caps
 MIN_DOLLARS_PER_TRADE = 0.0  # We allow very small fractional trades
 MAX_EQUITY_FRACTION_PER_TICKER = MAX_TICKER_EXPOSURE  # reuse your 30% cap
@@ -850,6 +866,16 @@ async def trade_loop_async(allowed_tickers=None):
 
         if state == "open":
             logging.info("Market open detected — entering trading loop immediately.")
+            # Capture market open timestamp for "first trade bias" + MVT timing guards
+            try:
+                clock = await asyncio.to_thread(SESSION.api.get_clock)
+                # Use NY timezone datetime for consistency with other logic
+                open_dt = clock.timestamp.astimezone(ny_tz)
+                SESSION.market_open_ts = open_dt
+                SESSION.last_market_open_date = open_dt.date()
+                SESSION.first_trade_done = False
+            except Exception as e:
+                logging.warning(f"Could not capture market open timestamp: {e}")
             break
     
     # Ensure we have tickers if not set during pre-open
@@ -866,6 +892,14 @@ async def trade_loop_async(allowed_tickers=None):
             logging.info(f"Market-open AI tickers loaded: {SESSION.TICKERS}")
 
     logging.info(f"Trading loop active with tickers: {SESSION.TICKERS}")
+    # Daily safety reset for first-trade bias if worker spans multiple days
+    try:
+        today = ny_now().date()
+        if SESSION.last_market_open_date != today:
+            SESSION.first_trade_done = False
+            SESSION.last_market_open_date = today
+    except Exception:
+        pass
     last_ticker_refresh = ny_now()
     while True:
         try:
@@ -1215,9 +1249,21 @@ async def process_ticker(ticker):
         # ================ ENTRY LOGIC (if flat) ================
         # Conservative Entry Logic (Step 2)
 
-        # 1. RSI conservative filter (avoid overbought)
-        if not pd.isna(rsi) and rsi > 68:
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=RSI_TOO_HIGH rsi={rsi:.1f}")
+        # 1. RSI filter (base, with optional first-trade bias)
+        rsi_max_allowed = 68
+        # First-trade-of-day bias: only relax RSI max for the very first entry after open, within window
+        minutes_since_open = None
+        if SESSION.market_open_ts:
+            try:
+                minutes_since_open = (ny_now() - SESSION.market_open_ts).total_seconds() / 60.0
+            except Exception:
+                minutes_since_open = None
+
+        if FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN:
+            rsi_max_allowed = FIRST_TRADE_RSI_MAX
+
+        if not pd.isna(rsi) and rsi > rsi_max_allowed:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=RSI_TOO_HIGH rsi={rsi:.1f} max={rsi_max_allowed}")
             return
 
         # 2. ATR volatility filter (avoid weak or explosive regimes)
@@ -1231,9 +1277,13 @@ async def process_ticker(ticker):
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=MACD_FALLING macd={macd:.4f} prev={prev_macd:.4f}")
             return
 
-        # 4. Bollinger Band filter – avoid chasing unless momentum is very strong
-        if close_price > bb_upper and rsi > 70:
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=BB_UPPER_OVERBOUGHT price={close_price:.2f} bb_upper={bb_upper:.2f} rsi={rsi:.1f}")
+        momentum_confirmed = (macd >= prev_macd)
+        prev_close = float(df['close'].iloc[-2]) if len(df) > 1 else close_price
+        trend_confirmed = (close_price >= prev_close * 0.998)
+
+        # 4. Bollinger Band filter – avoid chasing only when momentum is NOT confirming
+        if (close_price > bb_upper and rsi > 70) and not momentum_confirmed:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=BB_UPPER_OVERBOUGHT_NO_MOM price={close_price:.2f} bb_upper={bb_upper:.2f} rsi={rsi:.1f}")
             return
 
         # 5. Sentiment must be neutral or positive
@@ -1241,15 +1291,40 @@ async def process_ticker(ticker):
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=NEGATIVE_SENTIMENT sentiment={sentiment:.3f}")
             return
 
-        # 6. Score threshold aligned with Smart Exit Logic
-        CONSERVATIVE_ENTRY_THRESHOLD = SIGNAL_BUY_THRESHOLD * 1.05  # slightly stricter than exit threshold
-        if score < CONSERVATIVE_ENTRY_THRESHOLD:
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LOW_SCORE score={score:.3f} threshold={CONSERVATIVE_ENTRY_THRESHOLD:.3f}")
+        # 6. Score threshold (conditional) + Minimum Viable Trade (MVT)
+        base_threshold = SIGNAL_BUY_THRESHOLD * 1.05  # conservative baseline
+        threshold = base_threshold
+
+        # Conditional relaxation when momentum + trend confirm (still safe because we keep ATR sizing + stops)
+        if momentum_confirmed and trend_confirmed:
+            threshold = max(MVT_MIN_SCORE, SIGNAL_BUY_THRESHOLD * 0.90)
+
+        # First-trade bias: only reduce threshold for the first entry after open (within the first hour)
+        if FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN:
+            threshold = max(MVT_MIN_SCORE, threshold - FIRST_TRADE_SCORE_RELAX)
+
+        # MVT path: allow "good enough" setups even if score is slightly under threshold, ONLY when conditions are true
+        mvt_ok = False
+        if MVT_ENABLED:
+            if (
+                minutes_since_open is not None and minutes_since_open >= MVT_MINUTES_AFTER_OPEN
+                and (not pd.isna(rsi)) and (MVT_RSI_MIN <= rsi <= MVT_RSI_MAX)
+                and (not pd.isna(atr_pct)) and (atr_pct >= MVT_MIN_ATR_PCT)
+                and momentum_confirmed
+                and trend_confirmed
+                and sentiment >= 0
+            ):
+                mvt_ok = (score >= MVT_MIN_SCORE)
+
+        if score < threshold and not mvt_ok:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LOW_SCORE score={score:.3f} threshold={threshold:.3f} base={base_threshold:.3f} mvt_ok={mvt_ok}")
             return
 
+        if mvt_ok and score < threshold:
+            logging.info(f"[ENTRY ALLOWED:MVT] {ticker} | score={score:.3f} (min={MVT_MIN_SCORE:.3f}) rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open:.0f}")
+
         # 7. Trend acceleration – confirm short‑term momentum (allow flat)
-        prev_close = float(df['close'].iloc[-2]) if len(df) > 1 else close_price
-        if close_price < prev_close * 0.998:
+        if not trend_confirmed:
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=WEAK_TREND close={close_price:.2f} prev={prev_close:.2f}")
             return
 
@@ -1264,9 +1339,11 @@ async def process_ticker(ticker):
         if qty <= 0:
             return
 
-        logging.info(f"ENTRY {ticker}: conservative | px={close_price:.2f} qty={qty} score={score:.3f} rsi={rsi:.1f} macd rising atr%={atr_pct:.3%}")
+        reason = "MVT" if (mvt_ok and score < threshold) else ("FIRST_TRADE_BIAS" if (FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN) else "NORMAL")
+        logging.info(f"ENTRY {ticker}: {reason} | px={close_price:.2f} qty={qty} score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open if minutes_since_open is not None else 'na'}")
 
         if await place_order_async(ticker, qty, 'buy'):
+            SESSION.first_trade_done = True
             SESSION.recently_traded[ticker] = ny_now()
             SESSION.recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)
             SESSION.trade_history[ticker] = SESSION.trade_history.get(ticker, {})

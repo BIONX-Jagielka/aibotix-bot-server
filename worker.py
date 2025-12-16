@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64decode
@@ -29,6 +29,11 @@ ACTIVE_BOTS: Dict[str, asyncio.Task] = {}  # key = f"{user_id}:{mode}" -> asynci
 AI_RESCAN_INTERVAL_SECONDS = 7200  # 2 hours
 AI_SCORE_REPLACEMENT_THRESHOLD = 1.25  # 25% stronger score required
 
+# ----------------------------------------
+# Worker Heartbeat Configuration
+# ----------------------------------------
+HEARTBEAT_INTERVAL_SECONDS = 60  # Worker loop heartbeat interval
+
 # Track last AI scan time per user/mode
 LAST_AI_SCAN_AT: Dict[str, datetime] = {}  # key = f"{user_id}:{mode}" -> datetime
 LAST_MARKET_STATE: Dict[str, bool] = {}  # key = f"{user_id}:{mode}" -> is_open boolean
@@ -45,7 +50,7 @@ logger = logging.getLogger("aibotix.worker")
 
 
 def utc_now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ----------------------------------------
@@ -324,10 +329,10 @@ async def should_trigger_ai_scan(user_id: str, mode: str, trading_client) -> tup
     Returns (should_scan, reason)
     """
     key = f"{user_id}:{mode}"
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     
     # Check current market state
-    current_market_open = await asyncio.to_thread(is_market_open, trading_client)
+    current_market_open = await is_market_open(trading_client)
     previous_market_open = LAST_MARKET_STATE.get(key, False)
     
     # Update market state tracking
@@ -544,7 +549,7 @@ async def save_equity_snapshot(supabase, user_id: str, account):
 # ----------------------------------------
 # Worker: bot task lifecycle
 # ----------------------------------------
-async def worker_loop(poll_interval: int = 10) -> None:
+async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
     """
     Long-running worker with robust bot start/stop state management.
     
@@ -559,6 +564,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
     - No manual database cleanup required
     """
     logger.info("🔁 AIBOTIX worker loop started (robust state management)")
+    logger.info(f"⏰ Worker heartbeat interval: {HEARTBEAT_INTERVAL_SECONDS} seconds")
     
     # On startup, ACTIVE_BOTS starts empty - no auto-start from stale Supabase records
     logger.info("Worker startup: ACTIVE_BOTS registry initialized empty")
@@ -644,7 +650,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
                 
                 # Initialize AI scan tracking for this bot
                 bot_key = f"{user_id}:{mode}"
-                LAST_AI_SCAN_AT[bot_key] = datetime.utcnow()
+                LAST_AI_SCAN_AT[bot_key] = datetime.now(timezone.utc)
                 
                 # Initialize market state (assume closed to trigger immediate scan at open)
                 LAST_MARKET_STATE[bot_key] = False
@@ -741,7 +747,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
             active_rows = await fetch_active_bots()
             
             # Update heartbeats for running bots and handle AI rescanning
-            now_ts = datetime.utcnow().timestamp()
+            now_ts = datetime.now(timezone.utc).timestamp()
             if not hasattr(worker_loop, "_last_equity_save"):
                 worker_loop._last_equity_save = 0
             
@@ -819,7 +825,7 @@ async def worker_loop(poll_interval: int = 10) -> None:
                                         logger.warning("AI scan returned no tickers - keeping current selection")
                                     
                                     # Update last scan timestamp
-                                    LAST_AI_SCAN_AT[key] = datetime.utcnow()
+                                    LAST_AI_SCAN_AT[key] = datetime.now(timezone.utc)
                                     
                                 except Exception as scan_error:
                                     logger.error("AI ticker scan failed for %s: %s", key, scan_error)

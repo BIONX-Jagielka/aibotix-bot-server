@@ -34,6 +34,11 @@ AI_SCORE_REPLACEMENT_THRESHOLD = 1.25  # 25% stronger score required
 # ----------------------------------------
 HEARTBEAT_INTERVAL_SECONDS = 60  # Worker loop heartbeat interval
 
+# ----------------------------------------
+# Account Snapshot Configuration
+# ----------------------------------------
+SNAPSHOT_INTERVAL_SECONDS = 20 * 60  # 20 minutes for trade performance analytics
+
 # Track last AI scan time per user/mode
 LAST_AI_SCAN_AT: Dict[str, datetime] = {}  # key = f"{user_id}:{mode}" -> datetime
 LAST_MARKET_STATE: Dict[str, bool] = {}  # key = f"{user_id}:{mode}" -> is_open boolean
@@ -547,6 +552,59 @@ async def save_equity_snapshot(supabase, user_id: str, account):
 
 
 # ----------------------------------------
+# Helper: Account Performance Snapshot
+# ----------------------------------------
+async def write_account_snapshot(
+    supabase,
+    user_id: str,
+    mode: str,
+    trading_client,
+    reason: str = "heartbeat"
+):
+    """Write detailed account snapshot for trade performance analytics."""
+    try:
+        account = await asyncio.to_thread(trading_client.get_account)
+        positions = await asyncio.to_thread(trading_client.get_all_positions)
+
+        equity = float(account.equity)
+        cash = float(account.cash)
+        buying_power = float(account.buying_power)
+
+        capital_in_use = 0.0
+        unrealized_pnl = 0.0
+
+        for p in positions:
+            capital_in_use += float(p.market_value or 0)
+            unrealized_pnl += float(p.unrealized_pl or 0)
+
+        realized_pnl = equity - float(getattr(account, "last_equity", equity))
+        total_pnl = realized_pnl + unrealized_pnl
+
+        payload = {
+            "user_id": user_id,
+            "mode": mode,
+            "equity": equity,
+            "cash": cash,
+            "buying_power": buying_power,
+            "capital_in_use": capital_in_use,
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "total_pnl": total_pnl,
+            "snapshot_reason": reason,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        def _insert():
+            return supabase.table("bot_account_snapshots").insert(payload).execute()
+
+        await asyncio.to_thread(_insert)
+        logger.debug(f"[SNAPSHOT] {reason} snapshot saved for {user_id}:{mode}")
+
+    except Exception as e:
+        logger.warning(f"[SNAPSHOT] Failed to write account snapshot: {e}")
+
+
+# ----------------------------------------
 # Worker: bot task lifecycle
 # ----------------------------------------
 async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
@@ -645,6 +703,21 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
                     mode=mode,
                 )
                 
+                # Take initial account snapshot after bot startup
+                try:
+                    client_bundle = get_trading_client(user_id, mode)
+                    if client_bundle and client_bundle.get("trading_client"):
+                        trading_client = client_bundle["trading_client"]
+                        await write_account_snapshot(
+                            supabase=supabase,
+                            user_id=user_id,
+                            mode=mode,
+                            trading_client=trading_client,
+                            reason="bot_started"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to take startup snapshot for {key}: {e}")
+                
                 # Get AI tickers and initialize scan tracking
                 ai_tickers = await asyncio.to_thread(get_top_tickers, 5, user_id, mode)
                 
@@ -733,6 +806,21 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
         if key in LAST_MARKET_STATE:
             del LAST_MARKET_STATE[key]
         
+        # Take final account snapshot before stopping
+        try:
+            client_bundle = get_trading_client(user_id, mode)
+            if client_bundle and client_bundle.get("trading_client"):
+                trading_client = client_bundle["trading_client"]
+                await write_account_snapshot(
+                    supabase=supabase,
+                    user_id=user_id,
+                    mode=mode,
+                    trading_client=trading_client,
+                    reason="bot_stopped"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to take shutdown snapshot for {key}: {e}")
+        
         # Always update Supabase status to stopped
         await upsert_bot_status(user_id, mode, "stopped", 
                               message="Bot stopped via stop request")
@@ -750,8 +838,11 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
             now_ts = datetime.now(timezone.utc).timestamp()
             if not hasattr(worker_loop, "_last_equity_save"):
                 worker_loop._last_equity_save = 0
+            if not hasattr(worker_loop, "_last_snapshot_save"):
+                worker_loop._last_snapshot_save = 0
             
             should_save_equity = (now_ts - worker_loop._last_equity_save) >= 300
+            should_save_snapshot = (now_ts - worker_loop._last_snapshot_save) >= SNAPSHOT_INTERVAL_SECONDS
             
             # AI Ticker Rescanning Logic
             for row in active_rows:
@@ -857,6 +948,20 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
                                 await save_equity_snapshot(supabase, uid, account)
                             except Exception as e:
                                 logger.error("Failed to fetch account for equity snapshot: %s", e)
+                
+                # Account performance snapshots (20-minute interval)
+                if should_save_snapshot and key in ACTIVE_BOTS and not ACTIVE_BOTS[key].done():
+                    client_bundle = get_trading_client(uid, mode)
+                    if client_bundle:
+                        trading_client = client_bundle.get("trading_client")
+                        if trading_client:
+                            await write_account_snapshot(
+                                supabase=supabase,
+                                user_id=uid,
+                                mode=mode,
+                                trading_client=trading_client,
+                                reason="heartbeat_20min"
+                            )
             
             # Determine which bots should be running (START logic)
             intended_running = {
@@ -888,6 +993,8 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
             
             if should_save_equity:
                 worker_loop._last_equity_save = now_ts
+            if should_save_snapshot:
+                worker_loop._last_snapshot_save = now_ts
         
         except Exception:
             logger.exception("Worker loop iteration failed")

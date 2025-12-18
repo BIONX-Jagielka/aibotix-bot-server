@@ -862,6 +862,7 @@ async def trade_loop_async(allowed_tickers=None):
                 SESSION.TICKERS = list(selected_tickers)
                 SESSION.ACTIVE_TICKERS = list(selected_tickers)
                 logging.info(f"Pre-open AI tickers prepared: {SESSION.TICKERS}")
+                supabase_log(f"ai_scan_complete | tickers={SESSION.TICKERS}")
             continue
 
         if state == "open":
@@ -890,6 +891,7 @@ async def trade_loop_async(allowed_tickers=None):
             SESSION.TICKERS = list(selected_tickers)
             SESSION.ACTIVE_TICKERS = list(selected_tickers)
             logging.info(f"Market-open AI tickers loaded: {SESSION.TICKERS}")
+            supabase_log(f"ai_scan_complete | tickers={SESSION.TICKERS}")
 
     logging.info(f"Trading loop active with tickers: {SESSION.TICKERS}")
     # Daily safety reset for first-trade bias if worker spans multiple days
@@ -901,6 +903,7 @@ async def trade_loop_async(allowed_tickers=None):
     except Exception:
         pass
     last_ticker_refresh = ny_now()
+    last_heartbeat_log = ny_now()
     while True:
         try:
             # Step 3: daily resets & halts
@@ -911,6 +914,12 @@ async def trade_loop_async(allowed_tickers=None):
                 continue
 
             logging.info("Bot is evaluating trade opportunities...")
+            
+            # Heartbeat transparency log (rate limited to once per 60-120 seconds)
+            now = ny_now()
+            if (now - last_heartbeat_log).total_seconds() > 60:
+                supabase_log("bot_heartbeat | market=open | monitoring")
+                last_heartbeat_log = now
             # === Intelligent 30-Minute AI Ticker Refresh ===
             now = ny_now()
             if allowed_tickers is None and (now - last_ticker_refresh).total_seconds() > 1800:  # 30 minutes
@@ -1023,6 +1032,7 @@ async def trade_loop_async(allowed_tickers=None):
                     SESSION.ACTIVE_TICKERS = active
                     SESSION.TICKERS = active
                     logging.info(f"Updated ACTIVE_TICKERS (conservative mode): {SESSION.ACTIVE_TICKERS}")
+                    supabase_log(f"ai_scan_complete | tickers={SESSION.TICKERS}")
 
                     last_ticker_refresh = now
 
@@ -1076,6 +1086,7 @@ async def trade_loop_async(allowed_tickers=None):
                 continue
 
             tasks = []
+            entries_attempted = 0
             tickers_to_process = SESSION.ACTIVE_TICKERS or SESSION.TICKERS
             for ticker in tickers_to_process:
                 if not await is_market_open_async(ticker):
@@ -1096,8 +1107,15 @@ async def trade_loop_async(allowed_tickers=None):
                     continue
 
                 tasks.append(process_ticker(ticker))
+                entries_attempted += 1
 
             await asyncio.gather(*tasks)
+            
+            # Scan cycle summary (user transparency)
+            if entries_attempted == 0:
+                supabase_log("scan_complete | no_valid_entries")
+            elif entries_attempted > 0:
+                supabase_log("scan_complete | entries_rejected=filters")
 
             if SESSION.consecutive_losses >= 3:
                 logging.warning(f"Cooldown triggered due to 3 losses. Waiting {LOSS_COOLDOWN} seconds...")
@@ -1317,6 +1335,9 @@ async def process_ticker(ticker):
                 mvt_ok = (score >= MVT_MIN_SCORE)
 
         if score < threshold and not mvt_ok:
+            # Log near-miss cases (85-100% of threshold) for user transparency
+            if score >= threshold * 0.85:
+                supabase_log(f"entry_blocked | {ticker} | score={score:.2f} < threshold")
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LOW_SCORE score={score:.3f} threshold={threshold:.3f} base={base_threshold:.3f} mvt_ok={mvt_ok}")
             return
 
@@ -1341,6 +1362,9 @@ async def process_ticker(ticker):
 
         reason = "MVT" if (mvt_ok and score < threshold) else ("FIRST_TRADE_BIAS" if (FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN) else "NORMAL")
         logging.info(f"ENTRY {ticker}: {reason} | px={close_price:.2f} qty={qty} score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open if minutes_since_open is not None else 'na'}")
+        
+        # Trade intent transparency log
+        supabase_log(f"trade_signal | BUY {ticker} | score={score:.2f}")
 
         if await place_order_async(ticker, qty, 'buy'):
             SESSION.first_trade_done = True

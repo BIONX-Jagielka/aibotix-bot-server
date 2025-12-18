@@ -8,6 +8,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from base64 import b64decode
 from dotenv import load_dotenv
 
+# Import account snapshot function
+from worker import save_account_snapshot
+
 load_dotenv()
 
 # --------------------------------------------------------------------

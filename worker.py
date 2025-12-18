@@ -554,32 +554,44 @@ async def save_equity_snapshot(supabase, user_id: str, account):
 # ----------------------------------------
 # Helper: Account Performance Snapshot
 # ----------------------------------------
-async def write_account_snapshot(
-    supabase,
-    user_id: str,
-    mode: str,
-    trading_client,
-    reason: str = "heartbeat"
-):
-    """Write detailed account snapshot for trade performance analytics."""
+async def save_account_snapshot(user_id: str, mode: str, snapshot_reason: str):
+    """
+    Single source of truth for account snapshots.
+    Inserts one row into account_snapshots table for trade performance analytics.
+    """
     try:
+        # Get trading client for this user+mode
+        client_bundle = get_trading_client(user_id, mode)
+        if not client_bundle or not client_bundle.get("trading_client"):
+            logger.warning(f"[SNAPSHOT] No trading client found for {user_id}:{mode}")
+            return
+        
+        trading_client = client_bundle["trading_client"]
+        
+        # Fetch Alpaca account data
         account = await asyncio.to_thread(trading_client.get_account)
         positions = await asyncio.to_thread(trading_client.get_all_positions)
 
+        # Extract account metrics
         equity = float(account.equity)
         cash = float(account.cash)
         buying_power = float(account.buying_power)
-
+        
+        # Calculate position metrics
         capital_in_use = 0.0
+        open_positions_value = 0.0
         unrealized_pnl = 0.0
 
         for p in positions:
-            capital_in_use += float(p.market_value or 0)
-            unrealized_pnl += float(p.unrealized_pl or 0)
+            capital_in_use += float(getattr(p, 'cost_basis', 0) or 0)
+            open_positions_value += float(getattr(p, 'market_value', 0) or 0)
+            unrealized_pnl += float(getattr(p, 'unrealized_pl', 0) or 0)
 
-        realized_pnl = equity - float(getattr(account, "last_equity", equity))
+        # Calculate P&L metrics
+        realized_pnl = float(getattr(account, 'realized_pl', 0) or 0)
         total_pnl = realized_pnl + unrealized_pnl
 
+        # Prepare snapshot data
         payload = {
             "user_id": user_id,
             "mode": mode,
@@ -587,21 +599,23 @@ async def write_account_snapshot(
             "cash": cash,
             "buying_power": buying_power,
             "capital_in_use": capital_in_use,
+            "open_positions_value": open_positions_value,
             "realized_pnl": realized_pnl,
             "unrealized_pnl": unrealized_pnl,
             "total_pnl": total_pnl,
-            "snapshot_reason": reason,
+            "snapshot_reason": snapshot_reason,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
+        # Insert into account_snapshots table (insert-only)
         def _insert():
-            return supabase.table("bot_account_snapshots").insert(payload).execute()
+            return supabase.table("account_snapshots").insert(payload).execute()
 
         await asyncio.to_thread(_insert)
-        logger.debug(f"[SNAPSHOT] {reason} snapshot saved for {user_id}:{mode}")
+        logger.debug(f"[SNAPSHOT] {snapshot_reason} snapshot saved for {user_id}:{mode}")
 
     except Exception as e:
-        logger.warning(f"[SNAPSHOT] Failed to write account snapshot: {e}")
+        logger.warning(f"[SNAPSHOT] Failed to save account snapshot: {e}")
 
 
 # ----------------------------------------
@@ -705,16 +719,7 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
                 
                 # Take initial account snapshot after bot startup
                 try:
-                    client_bundle = get_trading_client(user_id, mode)
-                    if client_bundle and client_bundle.get("trading_client"):
-                        trading_client = client_bundle["trading_client"]
-                        await write_account_snapshot(
-                            supabase=supabase,
-                            user_id=user_id,
-                            mode=mode,
-                            trading_client=trading_client,
-                            reason="bot_started"
-                        )
+                    await save_account_snapshot(user_id, mode, "bot_start")
                 except Exception as e:
                     logger.warning(f"Failed to take startup snapshot for {key}: {e}")
                 
@@ -808,16 +813,7 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
         
         # Take final account snapshot before stopping
         try:
-            client_bundle = get_trading_client(user_id, mode)
-            if client_bundle and client_bundle.get("trading_client"):
-                trading_client = client_bundle["trading_client"]
-                await write_account_snapshot(
-                    supabase=supabase,
-                    user_id=user_id,
-                    mode=mode,
-                    trading_client=trading_client,
-                    reason="bot_stopped"
-                )
+            await save_account_snapshot(user_id, mode, "bot_stop")
         except Exception as e:
             logger.warning(f"Failed to take shutdown snapshot for {key}: {e}")
         
@@ -951,17 +947,7 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
                 
                 # Account performance snapshots (20-minute interval)
                 if should_save_snapshot and key in ACTIVE_BOTS and not ACTIVE_BOTS[key].done():
-                    client_bundle = get_trading_client(uid, mode)
-                    if client_bundle:
-                        trading_client = client_bundle.get("trading_client")
-                        if trading_client:
-                            await write_account_snapshot(
-                                supabase=supabase,
-                                user_id=uid,
-                                mode=mode,
-                                trading_client=trading_client,
-                                reason="heartbeat_20min"
-                            )
+                    await save_account_snapshot(uid, mode, "heartbeat")
             
             # Determine which bots should be running (START logic)
             intended_running = {

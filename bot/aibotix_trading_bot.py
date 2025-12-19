@@ -776,6 +776,43 @@ def update_trailing_stop(entry_price, current_price, trail_amount, previous_stop
     new_stop = max(previous_stop, current_price - trail_amount)
     return new_stop
 
+def detect_market_regime(df):
+    """
+    Detect market regime based on current conditions.
+    Returns: "TREND", "SQUEEZE", or "MEAN_REVERSION"
+    """
+    try:
+        # Need at least 20 bars for regime detection
+        if len(df) < 20:
+            return "TREND"  # Default to trend for safety
+            
+        # Get recent price action (last 20 bars)
+        recent_close = df['close'].tail(20)
+        recent_atr_pct = df['ATR_PCT'].tail(5) if 'ATR_PCT' in df else None
+        
+        # Calculate price volatility and trend strength
+        price_std = recent_close.std() / recent_close.mean() if recent_close.mean() > 0 else 0
+        
+        # Simple trend detection: compare current price to 10-period average
+        sma_10 = recent_close.tail(10).mean()
+        current_price = recent_close.iloc[-1]
+        trend_strength = abs(current_price - sma_10) / sma_10 if sma_10 > 0 else 0
+        
+        # ATR-based volatility assessment
+        avg_atr_pct = recent_atr_pct.mean() if recent_atr_pct is not None and len(recent_atr_pct) > 0 else 0.01
+        
+        # Regime classification logic
+        if trend_strength > 0.02 and avg_atr_pct > 0.015:
+            return "TREND"  # Strong directional movement with good volatility
+        elif avg_atr_pct < 0.008:
+            return "SQUEEZE"  # Low volatility, consolidating
+        else:
+            return "MEAN_REVERSION"  # Moderate volatility, likely range-bound
+            
+    except Exception as e:
+        logging.warning(f"Market regime detection failed: {e}")
+        return "TREND"  # Safe default
+
 
 # Global run-state is now controlled by the worker via task cancellation.
 # The trading loop itself does not manage process lifetime.
@@ -1178,6 +1215,10 @@ async def process_ticker(ticker):
         # Sentiment (placeholder currently returns 0)
         sentiment = await get_sentiment_score(ticker)
 
+        # Detect market regime for adaptive strategy
+        regime = detect_market_regime(df)
+        logging.debug(f"[REGIME] {ticker} | regime={regime}")
+
         # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
         score = calculate_signal_score(
             rsi=rsi, atr=atr_pct, sentiment=sentiment,
@@ -1309,13 +1350,24 @@ async def process_ticker(ticker):
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=NEGATIVE_SENTIMENT sentiment={sentiment:.3f}")
             return
 
-        # 6. Score threshold (conditional) + Minimum Viable Trade (MVT)
+        # 6. Score threshold (conditional) + Minimum Viable Trade (MVT) + Market Regime Awareness
         base_threshold = SIGNAL_BUY_THRESHOLD * 1.05  # conservative baseline
         threshold = base_threshold
+        
+        # Market regime-aware threshold adjustments (inspired by "Mastering the Trade")
+        regime_multiplier = 1.0
+        if regime == "TREND":
+            regime_multiplier = 0.95  # Slightly easier entry in trending markets
+        elif regime == "SQUEEZE":
+            regime_multiplier = 1.10  # Harder entry during low volatility
+        elif regime == "MEAN_REVERSION":
+            regime_multiplier = 0.90  # Easier entry but will reduce size below
+            
+        threshold = base_threshold * regime_multiplier
 
         # Conditional relaxation when momentum + trend confirm (still safe because we keep ATR sizing + stops)
         if momentum_confirmed and trend_confirmed:
-            threshold = max(MVT_MIN_SCORE, SIGNAL_BUY_THRESHOLD * 0.90)
+            threshold = max(MVT_MIN_SCORE, SIGNAL_BUY_THRESHOLD * 0.90 * regime_multiplier)
 
         # First-trade bias: only reduce threshold for the first entry after open (within the first hour)
         if FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN:
@@ -1359,12 +1411,18 @@ async def process_ticker(ticker):
         qty = calculate_position_size(ticker, RISK_PER_TRADE)
         if qty <= 0:
             return
+            
+        # Market regime-aware position sizing adjustment
+        if regime == "MEAN_REVERSION":
+            # Reduce position size by 40% for mean reversion trades (higher risk of false signals)
+            qty = qty * 0.6
+            logging.debug(f"[REGIME SIZING] {ticker} | MEAN_REVERSION regime - reduced position size by 40%")
 
         reason = "MVT" if (mvt_ok and score < threshold) else ("FIRST_TRADE_BIAS" if (FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN) else "NORMAL")
-        logging.info(f"ENTRY {ticker}: {reason} | px={close_price:.2f} qty={qty} score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open if minutes_since_open is not None else 'na'}")
+        logging.info(f"ENTRY {ticker}: {reason} | px={close_price:.2f} qty={qty} score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open if minutes_since_open is not None else 'na'} regime={regime}")
         
         # Trade intent transparency log
-        supabase_log(f"trade_signal | BUY {ticker} | score={score:.2f}")
+        supabase_log(f"trade_signal | BUY {ticker} | score={score:.2f} regime={regime}")
 
         if await place_order_async(ticker, qty, 'buy'):
             SESSION.first_trade_done = True

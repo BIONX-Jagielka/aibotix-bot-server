@@ -437,7 +437,7 @@ async def fetch_ai_tickers(user_id: str, mode: str) -> Optional[list[str]]:
             .select("ticker")
             .eq("user_id", user_id)
             .eq("mode", mode)
-            .order("rank", ascending=True)
+            .order("rank")
             .execute()
         )
 

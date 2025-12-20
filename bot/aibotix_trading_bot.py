@@ -813,6 +813,38 @@ def detect_market_regime(df):
         logging.warning(f"Market regime detection failed: {e}")
         return "TREND"  # Safe default
 
+def is_last_30_minutes_of_market():
+    """
+    Check if we're in the last 30 minutes of market hours.
+    Returns True if within 30 minutes of market close.
+    """
+    if SESSION.api is None:
+        return False
+    try:
+        clock = SESSION.api.get_clock()
+        if not clock.is_open:
+            return True  # Market closed, treat as "last 30 minutes"
+        
+        time_to_close = clock.next_close - clock.timestamp
+        return time_to_close <= datetime.timedelta(minutes=30)
+    except Exception as e:
+        logging.warning(f"Failed to check market close time: {e}")
+        return False  # Safe default
+
+def has_sufficient_buying_power(required_dollars):
+    """
+    Check if account has sufficient buying power for the trade.
+    """
+    account = get_account()
+    if account is None:
+        return False
+    try:
+        buying_power = float(account.buying_power)
+        return buying_power >= required_dollars
+    except Exception as e:
+        logging.warning(f"Failed to check buying power: {e}")
+        return False
+
 
 # Global run-state is now controlled by the worker via task cancellation.
 # The trading loop itself does not manage process lifetime.
@@ -952,10 +984,10 @@ async def trade_loop_async(allowed_tickers=None):
 
             logging.info("Bot is evaluating trade opportunities...")
             
-            # Heartbeat transparency log (rate limited to once per 60-120 seconds)
+            # Heartbeat transparency log (rate limited to once per 120 seconds)
             now = ny_now()
-            if (now - last_heartbeat_log).total_seconds() > 60:
-                supabase_log("bot_heartbeat | market=open | monitoring")
+            if (now - last_heartbeat_log).total_seconds() > 120:
+                supabase_log("bot_heartbeat | phase1_safety_active")
                 last_heartbeat_log = now
             # === Intelligent 30-Minute AI Ticker Refresh ===
             now = ny_now()
@@ -1218,6 +1250,12 @@ async def process_ticker(ticker):
         # Detect market regime for adaptive strategy
         regime = detect_market_regime(df)
         logging.debug(f"[REGIME] {ticker} | regime={regime}")
+        
+        # Phase 1 Safety: Hard block NEW ENTRIES during SQUEEZE regime (do not block exit management)
+        if regime == "SQUEEZE" and not have_position:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_REGIME")
+            supabase_log(f"entry_blocked | {ticker} | regime=SQUEEZE")
+            return
 
         # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
         score = calculate_signal_score(
@@ -1305,7 +1343,16 @@ async def process_ticker(ticker):
                 logging.info(f"[EXIT] RSI overbought safety exit {ticker} | rsi={rsi:.1f}")
                 return
 
+        # If we're still holding after exit checks, do not evaluate entry logic for this ticker
+        if have_position:
+            return
+
         # ================ ENTRY LOGIC (if flat) ================
+        # Phase 1 Safety: Block new entries in last 30 minutes of market
+        if is_last_30_minutes_of_market():
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LAST_30_MINUTES")
+            return
+        
         # Conservative Entry Logic (Step 2)
 
         # 1. RSI filter (base, with optional first-trade bias)
@@ -1417,6 +1464,13 @@ async def process_ticker(ticker):
             # Reduce position size by 40% for mean reversion trades (higher risk of false signals)
             qty = qty * 0.6
             logging.debug(f"[REGIME SIZING] {ticker} | MEAN_REVERSION regime - reduced position size by 40%")
+        
+        # Phase 1 Safety: Buying power guard
+        required_dollars = qty * close_price
+        if not has_sufficient_buying_power(required_dollars):
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=INSUFFICIENT_BUYING_POWER required=${required_dollars:.2f}")
+            supabase_log("entry_blocked | insufficient_buying_power")
+            return
 
         reason = "MVT" if (mvt_ok and score < threshold) else ("FIRST_TRADE_BIAS" if (FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN) else "NORMAL")
         logging.info(f"ENTRY {ticker}: {reason} | px={close_price:.2f} qty={qty} score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open if minutes_since_open is not None else 'na'} regime={regime}")

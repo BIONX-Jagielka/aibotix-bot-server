@@ -47,11 +47,12 @@ async def create_checkout_session(payload: CreateCheckoutSessionRequest):
             },
         )
 
-        supabase.table("subscriptions_pending").insert({
+        supabase.table("user_subscriptions").insert({
             "user_id": payload.user_id,
             "stripe_session_id": session.id,
             "price_id": settings.STRIPE_LIVE_PRICE_ID,
-            "status": "created",
+            "status": "pending",
+            "source": "checkout",
         }).execute()
 
         return {"checkout_url": session.url}

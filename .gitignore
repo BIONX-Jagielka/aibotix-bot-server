@@ -1,2 +1,11 @@
 .env
 *.env
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env
+.venv/

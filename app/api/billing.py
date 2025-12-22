@@ -60,5 +60,6 @@ async def create_checkout_session(payload: CreateCheckoutSessionRequest):
         return {"checkout_url": session.url}
 
     except Exception as e:
-        logger.exception("Failed to create checkout session")
-        raise HTTPException(status_code=500, detail="Failed to create checkout session")
+        error_message = str(e)
+        logger.exception(f"Stripe checkout session creation failed: {error_message}")
+        raise HTTPException(status_code=500, detail=error_message)

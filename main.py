@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 # Import account snapshot function
 from worker import save_account_snapshot
+from app.api import billing
 
 load_dotenv()
 
@@ -41,6 +42,8 @@ except Exception as e:
     raise e
 
 app = FastAPI()
+
+app.include_router(billing.router, prefix="/stripe", tags=["stripe"])
 
 
 # --------------------------------------------------------------------

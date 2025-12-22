@@ -9,6 +9,7 @@ from base64 import b64decode
 from dotenv import load_dotenv
 
 from app.api import billing
+from app.webhooks.stripe_webhook import router as stripe_webhook_router
 
 load_dotenv()
 
@@ -42,6 +43,7 @@ except Exception as e:
 app = FastAPI()
 
 app.include_router(billing.router, prefix="/stripe", tags=["stripe"])
+app.include_router(stripe_webhook_router, prefix="/stripe", tags=["stripe-webhook"])
 
 
 # --------------------------------------------------------------------

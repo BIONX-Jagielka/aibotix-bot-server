@@ -43,12 +43,15 @@ async def stripe_webhook(request: Request):
     if event_type == "checkout.session.completed":
         user_id = data.get("metadata", {}).get("user_id")
         subscription_id = data.get("subscription")
+        customer_id = data.get("customer")
 
-        if user_id and subscription_id:
-            supabase.table("subscriptions").upsert({
+        if user_id and subscription_id and customer_id:
+            supabase.table("user_subscriptions").upsert({
                 "user_id": user_id,
                 "stripe_subscription_id": subscription_id,
+                "stripe_customer_id": customer_id,
                 "status": "active",
+                "plan": "live",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }, on_conflict="user_id").execute()
 
@@ -57,7 +60,7 @@ async def stripe_webhook(request: Request):
         subscription_id = data.get("subscription")
 
         if subscription_id:
-            supabase.table("subscriptions").update({
+            supabase.table("user_subscriptions").update({
                 "status": "past_due",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
@@ -67,7 +70,7 @@ async def stripe_webhook(request: Request):
         status = data.get("status")
 
         if subscription_id and status:
-            supabase.table("subscriptions").update({
+            supabase.table("user_subscriptions").update({
                 "status": status,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
@@ -77,8 +80,8 @@ async def stripe_webhook(request: Request):
         subscription_id = data.get("id")
 
         if subscription_id:
-            supabase.table("subscriptions").update({
-                "status": "cancelled",
+            supabase.table("user_subscriptions").update({
+                "status": "canceled",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
 

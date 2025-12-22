@@ -56,3 +56,4 @@ websockets==15.0.1
 yfinance==0.2.66
 cryptography>=42.0.0
 stripe>=8.0.0
+pydantic-settings

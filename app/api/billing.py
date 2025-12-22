@@ -26,9 +26,6 @@ class CreateCheckoutSessionRequest(BaseModel):
 @router.post("/create-checkout-session")
 async def create_checkout_session(payload: CreateCheckoutSessionRequest):
     try:
-        user = supabase.table("users").select("id").eq("id", payload.user_id).single().execute()
-        if not user.data:
-            raise HTTPException(status_code=404, detail="User not found")
 
         session = stripe.checkout.Session.create(
             mode="subscription",

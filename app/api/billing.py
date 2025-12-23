@@ -47,13 +47,6 @@ async def create_checkout_session(payload: CreateCheckoutSessionRequest):
             },
         )
 
-        supabase.table("user_subscriptions").insert({
-            "user_id": payload.user_id,
-            "status": "incomplete",
-            "plan": "live",
-            "updated_at": "now()"
-        }).execute()
-
         return {"checkout_url": session.url}
 
     except Exception as e:

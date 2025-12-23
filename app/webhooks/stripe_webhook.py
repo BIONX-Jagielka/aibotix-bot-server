@@ -68,20 +68,28 @@ async def stripe_webhook(request: Request):
     elif event_type == "customer.subscription.updated":
         subscription_id = data.get("id")
         status = data.get("status")
+        current_period_end = data.get("current_period_end")
 
         if subscription_id and status:
             supabase.table("user_subscriptions").update({
                 "status": status,
+                "current_period_end": datetime.fromtimestamp(
+                    current_period_end, timezone.utc
+                ).isoformat() if current_period_end else None,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
 
     # 3️⃣ Subscription cancelled → disable access
     elif event_type == "customer.subscription.deleted":
         subscription_id = data.get("id")
+        current_period_end = data.get("current_period_end")
 
         if subscription_id:
             supabase.table("user_subscriptions").update({
                 "status": "canceled",
+                "current_period_end": datetime.fromtimestamp(
+                    current_period_end, timezone.utc
+                ).isoformat() if current_period_end else None,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
 

@@ -6,7 +6,7 @@ import logging
 
 from app.config import settings
 
-router = APIRouter()
+router = APIRouter(prefix="/billing", tags=["billing"])
 
 logger = logging.getLogger("billing")
 
@@ -64,7 +64,7 @@ async def create_checkout_session(payload: CreateCheckoutSessionRequest):
             },
         )
 
-        return {"checkout_url": session.url}
+        return {"url": session.url}
 
     except Exception as e:
         logger.exception("Stripe checkout session creation failed")

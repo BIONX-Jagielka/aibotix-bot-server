@@ -23,13 +23,31 @@ class CreateCheckoutSessionRequest(BaseModel):
     email: str | None = None
 
 
+class CreatePortalSessionRequest(BaseModel):
+    user_id: str
+
+
 @router.post("/create-checkout-session")
 async def create_checkout_session(payload: CreateCheckoutSessionRequest):
     try:
+        # Get or create Stripe customer
+        customer = None
 
+        if payload.email:
+            customers = stripe.Customer.list(email=payload.email, limit=1)
+            if customers.data:
+                customer = customers.data[0]
+            else:
+                customer = stripe.Customer.create(
+                    email=payload.email,
+                    metadata={"user_id": payload.user_id}
+                )
+
+        # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             mode="subscription",
             payment_method_types=["card"],
+            customer=customer.id if customer else None,
             line_items=[
                 {
                     "price": settings.STRIPE_LIVE_PRICE_ID,
@@ -38,7 +56,6 @@ async def create_checkout_session(payload: CreateCheckoutSessionRequest):
             ],
             success_url=settings.FRONTEND_SUCCESS_URL,
             cancel_url=settings.FRONTEND_CANCEL_URL,
-            customer_email=payload.email if payload.email else None,
             subscription_data={
                 "metadata": {
                     "user_id": payload.user_id,
@@ -50,6 +67,36 @@ async def create_checkout_session(payload: CreateCheckoutSessionRequest):
         return {"checkout_url": session.url}
 
     except Exception as e:
-        error_message = str(e)
-        logger.exception(f"Stripe checkout session creation failed: {error_message}")
-        raise HTTPException(status_code=500, detail=error_message)
+        logger.exception("Stripe checkout session creation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/create-portal-session")
+async def create_portal_session(payload: CreatePortalSessionRequest):
+    try:
+        # Fetch user's Stripe customer ID from Supabase
+        result = (
+            supabase
+            .table("user_subscriptions")
+            .select("stripe_customer_id")
+            .eq("user_id", payload.user_id)
+            .single()
+            .execute()
+        )
+
+        stripe_customer_id = result.data.get("stripe_customer_id")
+
+        if not stripe_customer_id:
+            raise HTTPException(status_code=400, detail="Stripe customer not found")
+
+        # Create Stripe customer portal session
+        portal_session = stripe.billing_portal.Session.create(
+            customer=stripe_customer_id,
+            return_url=settings.FRONTEND_SUCCESS_URL,
+        )
+
+        return {"portal_url": portal_session.url}
+
+    except Exception as e:
+        logger.exception("Stripe portal session creation failed")
+        raise HTTPException(status_code=500, detail=str(e))

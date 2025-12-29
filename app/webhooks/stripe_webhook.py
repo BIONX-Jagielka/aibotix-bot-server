@@ -3,6 +3,7 @@ import stripe
 from fastapi import APIRouter, Request, HTTPException
 from supabase import create_client, Client
 from datetime import datetime, timezone
+import requests
 
 router = APIRouter()
 
@@ -11,9 +12,10 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+EDGE_EMAIL_FUNCTION_URL = os.getenv("EDGE_EMAIL_FUNCTION_URL")
 
 # Safety checks
-if not all([STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY]):
+if not all([STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY, EDGE_EMAIL_FUNCTION_URL]):
     raise RuntimeError("Missing required environment variables for Stripe webhook")
 
 stripe.api_key = STRIPE_SECRET_KEY
@@ -70,6 +72,19 @@ async def stripe_webhook(request: Request):
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }, on_conflict="user_id").execute()
             print("[STRIPE] user_subscriptions updated → active")
+
+            try:
+                requests.post(
+                    EDGE_EMAIL_FUNCTION_URL,
+                    json={
+                        "type": "subscription_activated",
+                        "user_id": user_id,
+                    },
+                    timeout=5,
+                )
+                print("[EMAIL] Subscription activated email triggered")
+            except Exception as e:
+                print(f"[EMAIL] Failed to trigger activation email: {e}")
 
     # 2️⃣ Payment failed → mark as past_due
     elif event_type == "invoice.payment_failed":
@@ -128,6 +143,18 @@ async def stripe_webhook(request: Request):
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
             print("[STRIPE] user_subscriptions updated → canceled")
+            try:
+                requests.post(
+                    EDGE_EMAIL_FUNCTION_URL,
+                    json={
+                        "type": "subscription_canceled",
+                        "subscription_id": subscription_id,
+                    },
+                    timeout=5,
+                )
+                print("[EMAIL] Subscription canceled email triggered")
+            except Exception as e:
+                print(f"[EMAIL] Failed to trigger cancellation email: {e}")
 
     else:
         # Unhandled but acknowledged event

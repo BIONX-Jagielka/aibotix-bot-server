@@ -27,6 +27,11 @@ class CreatePortalSessionRequest(BaseModel):
     user_id: str
 
 
+# New request model for cancel subscription
+class CancelSubscriptionRequest(BaseModel):
+    user_id: str
+
+
 @router.post("/create-checkout-session")
 async def create_checkout_session(payload: CreateCheckoutSessionRequest):
     try:
@@ -99,4 +104,33 @@ async def create_portal_session(payload: CreatePortalSessionRequest):
 
     except Exception as e:
         logger.exception("Stripe portal session creation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# New route for cancelling a subscription
+@router.post("/cancel-subscription")
+async def cancel_subscription(payload: CancelSubscriptionRequest):
+    try:
+        # Fetch user's Stripe subscription ID from Supabase
+        result = (
+            supabase
+            .table("user_subscriptions")
+            .select("stripe_subscription_id")
+            .eq("user_id", payload.user_id)
+            .single()
+            .execute()
+        )
+
+        stripe_subscription_id = result.data.get("stripe_subscription_id")
+
+        if not stripe_subscription_id:
+            raise HTTPException(status_code=400, detail="Stripe subscription not found")
+
+        # Cancel subscription immediately
+        stripe.Subscription.delete(stripe_subscription_id)
+
+        return {"status": "cancelled"}
+
+    except Exception as e:
+        logger.exception("Stripe subscription cancellation failed")
         raise HTTPException(status_code=500, detail=str(e))

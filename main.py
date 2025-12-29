@@ -40,7 +40,21 @@ except Exception as e:
     # Re-raise so Render fails fast if config is broken
     raise e
 
+
 app = FastAPI()
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://aibotix.co.uk",
+        "https://www.aibotix.co.uk",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(billing.router, prefix="/stripe", tags=["stripe"])
 app.include_router(stripe_webhook_router, prefix="/stripe", tags=["stripe-webhook"])

@@ -77,7 +77,7 @@ async def stripe_webhook(request: Request):
                 requests.post(
                     EDGE_EMAIL_FUNCTION_URL,
                     json={
-                        "type": "subscription_activated",
+                        "type": "activated",
                         "user_id": user_id,
                     },
                     timeout=5,
@@ -143,18 +143,28 @@ async def stripe_webhook(request: Request):
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("stripe_subscription_id", subscription_id).execute()
             print("[STRIPE] user_subscriptions updated → canceled")
-            try:
-                requests.post(
-                    EDGE_EMAIL_FUNCTION_URL,
-                    json={
-                        "type": "subscription_canceled",
-                        "subscription_id": subscription_id,
-                    },
-                    timeout=5,
-                )
-                print("[EMAIL] Subscription canceled email triggered")
-            except Exception as e:
-                print(f"[EMAIL] Failed to trigger cancellation email: {e}")
+            # Fetch user_id for email
+            record = supabase.table("user_subscriptions") \
+                .select("user_id") \
+                .eq("stripe_subscription_id", subscription_id) \
+                .single() \
+                .execute()
+
+            user_id = record.data["user_id"] if record.data else None
+
+            if user_id:
+                try:
+                    requests.post(
+                        EDGE_EMAIL_FUNCTION_URL,
+                        json={
+                            "type": "canceled",
+                            "user_id": user_id,
+                        },
+                        timeout=5,
+                    )
+                    print("[EMAIL] Subscription canceled email triggered")
+                except Exception as e:
+                    print(f"[EMAIL] Failed to trigger cancellation email: {e}")
 
     else:
         # Unhandled but acknowledged event

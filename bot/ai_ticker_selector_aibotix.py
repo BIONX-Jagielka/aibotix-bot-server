@@ -76,8 +76,12 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 RSI_PERIOD = 14
 
 # Limits to control how many symbols we screen each run
-MAX_TRADABLE_SCREEN = 400  # how many symbols to volume-screen
+MAX_TRADABLE_SCREEN = 250  # how many symbols to volume-screen
 MAX_INDICATOR_TASKS = 60   # how many symbols to fetch intraday indicators for
+
+# --- Bad data memory (prevents re-scanning symbols with no bars) ---
+BAD_DATA_COOLDOWN_SECONDS = 6 * 60 * 60  # 6 hours
+_BAD_DATA_REGISTRY = {}  # symbol -> last_failed_timestamp
 
 def compute_rsi(series, period):
     delta = series.diff()
@@ -93,6 +97,16 @@ def compute_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
+# --- Bad data registry helpers ---
+def _is_in_bad_data_cooldown(symbol: str) -> bool:
+    ts = _BAD_DATA_REGISTRY.get(symbol)
+    if ts is None:
+        return False
+    return (time.time() - ts) < BAD_DATA_COOLDOWN_SECONDS
+
+def _mark_bad_data(symbol: str):
+    _BAD_DATA_REGISTRY[symbol] = time.time()
+
 async def fetch_indicators(symbol: str, mode: str):
     try:
         data_client, trading_client = init_clients(mode)
@@ -100,11 +114,13 @@ async def fetch_indicators(symbol: str, mode: str):
         bars = data_client.get_stock_bars(bars_req).df
         if bars.empty:
             logging.warning(f"No data returned for {symbol}")
+            _mark_bad_data(symbol)
             return None
 
         # Require a minimum number of bars so ATR / EMA / volume windows have data
         if len(bars) < 30:
             logging.warning(f"Not enough intraday bars for {symbol}, skipping.")
+            _mark_bad_data(symbol)
             return None
 
         df = bars.copy()
@@ -120,6 +136,7 @@ async def fetch_indicators(symbol: str, mode: str):
         return df
     except Exception as e:
         logging.warning(f"Fetch failed for {symbol}: {e}")
+        _mark_bad_data(symbol)
         # Do not raise here – return None so other symbols can still be processed
         return None
 
@@ -139,6 +156,8 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
     logging.info(f"[DEBUG] First 10 tradable symbols: {tradable[:10]}")
     volume_filtered = []
     for symbol in tradable[:MAX_TRADABLE_SCREEN]:
+        if _is_in_bad_data_cooldown(symbol):
+            continue
         try:
             logging.info(f"Checking symbol: {symbol}")
             d_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=1)
@@ -150,6 +169,7 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                 if len(failed_symbols) <= 10:
                     logging.warning(f"[DEBUG] {symbol} failed - empty bars.")
                 logging.warning(f"{symbol} returned empty bars.")
+                _mark_bad_data(symbol)
                 continue
 
             # Now it's safe to inspect the last bar for debug logging
@@ -163,8 +183,8 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             vol = bars.iloc[-1]['volume']
             close = bars.iloc[-1]['close']
             dollar_volume = vol * close
-            # Slightly relaxed filters so we don't end up with zero candidates in quiet sessions
-            if vol > 50 and dollar_volume > 500 and close > 0.01:
+            # Stronger liquidity filter (reduces garbage symbols)
+            if vol >= 50_000 and dollar_volume >= 1_000_000 and close >= 5.0:
                 volume_filtered.append(symbol)
         except Exception as e:
             logging.warning(f"Error processing {symbol}: {e}")

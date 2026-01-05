@@ -31,6 +31,13 @@ class BotSession:
         self.recently_traded = {}
         self.trade_history = {}
         self.ACTIVE_TICKERS = []
+        
+        # Smart Ticker Recovery Lock (per-ticker)
+        self.ticker_recovery_lock = {}
+        
+        # Defensive logic state
+        self.session_peak_equity = None
+        self.buy_pause_until = None
 
 # Multi-user session registry: one BotSession per (user_id, mode)
 SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
@@ -151,6 +158,12 @@ RSI_PERIOD = 14
 MAX_DRAWDOWN = 0.10  # 10%
 MAX_TRADES_PER_HOUR = 5
 MAX_TICKER_EXPOSURE = 0.30  # 30% of equity
+
+# --- Position sizing safety caps (prevents oversized notional trades) ---
+# Cap any single trade notional to a small slice of equity AND an absolute ceiling.
+# This is separate from MAX_TICKER_EXPOSURE (portfolio concentration cap).
+MAX_TRADE_NOTIONAL_PCT = 0.05      # 5% of usable equity per entry
+MAX_TRADE_NOTIONAL_ABS = 2500.0    # hard cap in account currency (USD). Set None to disable.
 LOSS_COOLDOWN = 300  # 5 minutes
 STOP_LOSS_ATR_MULT = 1.5
 TAKE_PROFIT_ATR_MULT = 2.0
@@ -595,10 +608,111 @@ def close_position(symbol):
         supabase_log(
             f"position_closed | {symbol} | pnl={pnl:.2f} @ {datetime.datetime.now(ny_tz).isoformat()}"
         )
+        # === Smart Ticker Recovery Lock (loss-based) ===
+        if pnl < 0:
+            state = _get_recovery_state(symbol)
+            state.locked = True
+            state.locked_at = ny_now()
+            state.reason = "loss_exit"
+            state.exit_price = current_price
+            state.lowest_since_lock = current_price
+            state.bars_without_new_low = 0
+
+            # Capture context at lock time
+            try:
+                df_lock = fetch_data(symbol)
+                if df_lock is not None:
+                    state.lock_rsi = float(df_lock['RSI'].iloc[-1])
+                    state.lock_atr_pct = float(df_lock['ATR_PCT'].iloc[-1])
+                    state.lock_score = SESSION.trade_history.get(symbol, {}).get('last_signal_score')
+            except Exception:
+                pass
+
+            supabase_log(
+                f"ticker_locked | {symbol} | reason=loss_exit "
+                f"| rsi={state.lock_rsi} atr_pct={state.lock_atr_pct} score={state.lock_score}"
+            )
         return pnl
     except Exception as e:
         logging.error(f"Failed to close {symbol}: {e}")
         return None
+# === Smart Ticker Recovery Lock structures and helpers ===
+class TickerRecoveryState:
+    def __init__(self):
+        self.locked = False
+        self.locked_at = None
+        self.reason = None
+        self.exit_price = None
+        self.lowest_since_lock = None
+        self.bars_without_new_low = 0
+        self.lock_rsi = None
+        self.lock_atr_pct = None
+        self.lock_score = None
+
+
+def _get_recovery_state(ticker: str) -> TickerRecoveryState:
+    state = SESSION.ticker_recovery_lock.get(ticker)
+    if state is None:
+        state = TickerRecoveryState()
+        SESSION.ticker_recovery_lock[ticker] = state
+    return state
+
+# Recovery-check logic helper
+def _check_recovery_and_update_state(ticker: str, price: float, rsi: float | None,
+                                     atr_pct: float | None, score: float | None) -> bool:
+    """
+    Returns True if ticker is eligible to trade.
+    If locked, requires >=2 recovery conditions to unlock.
+    """
+    state = _get_recovery_state(ticker)
+    if not state.locked:
+        return True
+
+    conditions_met = []
+
+    # 1) RSI back to neutral
+    if rsi is not None and 45 <= rsi <= 60:
+        conditions_met.append("rsi_neutral")
+
+    # 2) Price stabilisation (no new lows)
+    if state.lowest_since_lock is None:
+        state.lowest_since_lock = price
+
+    if price < state.lowest_since_lock:
+        state.lowest_since_lock = price
+        state.bars_without_new_low = 0
+    else:
+        state.bars_without_new_low += 1
+
+    if state.bars_without_new_low >= 3:
+        conditions_met.append("price_stabilised")
+
+    # 3) Signal score positive again
+    if score is not None and score > 0:
+        conditions_met.append("score_positive")
+
+    # 4) ATR normalisation (avoid falling knife)
+    if (
+        atr_pct is not None
+        and state.lock_atr_pct is not None
+        and atr_pct <= state.lock_atr_pct * 1.10
+    ):
+        conditions_met.append("atr_normalised")
+
+    if len(conditions_met) >= 2:
+        state.locked = False
+        supabase_log(
+            f"ticker_released | {ticker} | conditions={','.join(conditions_met)}"
+        )
+        return True
+
+    # Still locked
+    reason_log(
+        f"ticker_locked:{ticker}",
+        f"ticker_locked_skip | {ticker} | waiting_for_recovery "
+        f"| met={conditions_met} bars_no_low={state.bars_without_new_low}"
+    )
+    return False
 
 def update_pnl():
     if SESSION.api is None:
@@ -621,6 +735,25 @@ def update_pnl():
         except Exception as e:
             logging.error(f"P&L calc error for {position.symbol}: {e}")
     logging.info(f"Realized P&L: ${SESSION.realized_pnl:.2f}, Unrealized P&L: ${SESSION.unrealized_pnl:.2f}")
+    
+    # Track peak equity for defensive logic
+    current_equity = get_equity()
+    if SESSION.session_peak_equity is None:
+        SESSION.session_peak_equity = current_equity
+    else:
+        SESSION.session_peak_equity = max(SESSION.session_peak_equity, current_equity)
+    
+    # Smart drawdown defense (NO HALT)
+    drawdown_pct = 0
+    if SESSION.session_peak_equity:
+        drawdown_pct = (current_equity - SESSION.session_peak_equity) / SESSION.session_peak_equity
+    
+    if drawdown_pct <= -0.004:
+        now = datetime.datetime.now(ny_tz)
+        if not SESSION.buy_pause_until or now >= SESSION.buy_pause_until:
+            SESSION.buy_pause_until = now + datetime.timedelta(minutes=10)
+            supabase_log(f"defensive_mode | buy_paused_10min | drawdown={drawdown_pct:.2%}")
+    
     # Optional: lightweight log line into bot_logs (does not assume bot_status schema)
     supabase_log(
         f"pnl_update | realized={SESSION.realized_pnl:.2f} unrealized={SESSION.unrealized_pnl:.2f} equity={get_equity():.2f}"
@@ -656,12 +789,19 @@ def calculate_position_size(symbol, risk_per_trade):
 
     raw_qty = max_risk / risk_per_share
 
-    # Cap by per-ticker equity exposure
-    max_dollars = usable_equity * MAX_EQUITY_FRACTION_PER_TICKER
-    if current_price > 0:
-        raw_qty = min(raw_qty, max_dollars / current_price)
+    # Cap by per-ticker equity exposure (portfolio concentration)
+    max_dollars_per_ticker = usable_equity * MAX_EQUITY_FRACTION_PER_TICKER
 
-    # Also make sure we meet min dollars per trade if we do trade
+    # Cap by per-trade notional (entry sizing) to prevent oversized single entries
+    max_dollars_per_trade = usable_equity * MAX_TRADE_NOTIONAL_PCT if MAX_TRADE_NOTIONAL_PCT else max_dollars_per_ticker
+    if MAX_TRADE_NOTIONAL_ABS is not None:
+        max_dollars_per_trade = min(max_dollars_per_trade, float(MAX_TRADE_NOTIONAL_ABS))
+
+    # Apply both caps
+    effective_max_dollars = min(max_dollars_per_ticker, max_dollars_per_trade)
+    if current_price > 0:
+        raw_qty = min(raw_qty, effective_max_dollars / current_price)
+
     return round(float(raw_qty), 4)
 
 def fetch_data(symbol):
@@ -1313,7 +1453,15 @@ async def process_ticker(ticker):
             BASE_TP         = 0.03    # 3%
             EXT_TP          = 0.05    # 5%
 
-            # 1. Exit if losing and score turns bad
+            # 1. Faster defensive loss exit at -0.3%
+            if pnl_pct <= -0.003:
+                pnl = close_position(ticker)
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                supabase_log(f"defensive_exit | {ticker} | pnl={pnl_pct:.2%}")
+                return
+
+            # 2. Exit if losing and score turns bad
             if pnl_pct <= 0 and score <= SIGNAL_SELL_THRESHOLD:
                 pnl = close_position(ticker)
                 SESSION.recently_traded[ticker] = ny_now()
@@ -1321,7 +1469,7 @@ async def process_ticker(ticker):
                 logging.info(f"[EXIT] Defensive loss exit {ticker} | pnl={pnl_pct:.2%}")
                 return
 
-            # 2. Reversal exit protecting >0.1% profits
+            # 3. Reversal exit protecting >0.1% profits
             if pnl_pct >= MIN_LOCK_PROFIT and (new_peak - pnl_pct) >= REVERSAL_DROP:
                 pnl = close_position(ticker)
                 SESSION.recently_traded[ticker] = ny_now()
@@ -1329,7 +1477,7 @@ async def process_ticker(ticker):
                 logging.info(f"[EXIT] Reversal exit {ticker} | pnl={pnl_pct:.2%}, peak={new_peak:.2%}")
                 return
 
-            # 3. Standard 3% take-profit unless momentum strong
+            # 4. Standard 3% take-profit unless momentum strong
             if BASE_TP <= pnl_pct < EXT_TP:
                 momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 70)
                 if momentum_weak:
@@ -1339,7 +1487,7 @@ async def process_ticker(ticker):
                     logging.info(f"[EXIT] Base 3% TP exit {ticker} | pnl={pnl_pct:.2%}")
                     return
 
-            # 4. High-profit exit above 5% if momentum weakens
+            # 5. High-profit exit above 5% if momentum weakens
             if pnl_pct >= EXT_TP:
                 momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 72)
                 if momentum_weak:
@@ -1349,7 +1497,7 @@ async def process_ticker(ticker):
                     logging.info(f"[EXIT] High-profit exit {ticker} | pnl={pnl_pct:.2%}")
                     return
 
-            # 5. Fallback trailing stop
+            # 6. Fallback trailing stop
             trail_amount = atr * STOP_LOSS_ATR_MULT
             prev_stop = SESSION.recently_traded.get(f"{ticker}_stop", entry_price - trail_amount)
             new_stop = update_trailing_stop(entry_price, close_price, trail_amount, prev_stop)
@@ -1362,7 +1510,7 @@ async def process_ticker(ticker):
                 logging.info(f"[EXIT] Trailing stop exit {ticker}")
                 return
 
-            # 6. RSI safety exit
+            # 7. RSI safety exit
             if not pd.isna(rsi) and rsi >= 75 and pnl_pct > 0:
                 pnl = close_position(ticker)
                 SESSION.recently_traded[ticker] = ny_now()
@@ -1374,7 +1522,25 @@ async def process_ticker(ticker):
         if have_position:
             return
 
+        # === Smart Ticker Recovery Lock Guard ===
+        if not _check_recovery_and_update_state(
+            ticker=ticker,
+            price=close_price,
+            rsi=None if pd.isna(rsi) else rsi,
+            atr_pct=None if pd.isna(atr_pct) else atr_pct,
+            score=score
+        ):
+            return
         # ================ ENTRY LOGIC (if flat) ================
+        # Defensive mode: Check if BUY entries are paused
+        if SESSION.buy_pause_until:
+            if datetime.datetime.now(ny_tz) < SESSION.buy_pause_until:
+                logging.info(f"[DEFENSIVE MODE] Buy paused until {SESSION.buy_pause_until}")
+                return
+            else:
+                SESSION.buy_pause_until = None
+                supabase_log("defensive_mode | buy_resumed")
+        
         # Phase 1 Safety: Block new entries in last 30 minutes of market
         if is_last_30_minutes_of_market():
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LAST_30_MINUTES")

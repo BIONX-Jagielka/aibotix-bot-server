@@ -122,6 +122,21 @@ def supabase_log(message: str) -> None:
     except Exception as e:
         logging.error(f"Supabase log error: {e}")
 
+# Rate-limited transparency logging (prevents spam)
+_last_reason_log: dict[str, datetime.datetime] = {}
+
+def reason_log(key: str, message: str, min_seconds: int = 120) -> None:
+    """Log a reason at most once per `min_seconds` per key."""
+    try:
+        now = datetime.datetime.now(ny_tz)
+    except Exception:
+        now = datetime.datetime.utcnow()
+    last = _last_reason_log.get(key)
+    if last and (now - last).total_seconds() < min_seconds:
+        return
+    _last_reason_log[key] = now
+    supabase_log(message)
+
 load_dotenv()
 
 API_KEY = None
@@ -726,9 +741,15 @@ INDICATOR_WEIGHTS = {
 SIGNAL_BUY_THRESHOLD = 0.20   # how strong the combined signal must be to enter
 SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
 
+# === Tiered Execution Thresholds ===
+TIER1_THRESHOLD_MULT = 1.00   # full confidence
+TIER2_THRESHOLD_MULT = 0.85   # good but not perfect
+TIER2_SIZE_MULT = 0.50        # half-size entries
+
 # Volatility guard (ignore ultra-quiet or too-wild regimes)
-MIN_ATR_PCT = 0.003   # 0.3% of price
-MAX_ATR_PCT = 0.08    # 8% of price
+# NOTE: slightly widened to allow more tradable setups while still avoiding dead/chaotic regimes
+MIN_ATR_PCT = 0.002   # 0.2% of price
+MAX_ATR_PCT = 0.09    # 9% of price
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
@@ -739,7 +760,7 @@ MVT_ENABLED = True
 MVT_MIN_SCORE = 0.18                  # allow "good enough" setups when momentum/trend confirm
 MVT_RSI_MIN = 42
 MVT_RSI_MAX = 62
-MVT_MIN_ATR_PCT = 0.0015              # 0.15% ATR% minimum for MVT
+MVT_MIN_ATR_PCT = 0.0020              # 0.20% ATR% minimum for MVT
 MVT_MINUTES_AFTER_OPEN = 15           # don't MVT in the very first minutes
 FIRST_TRADE_BIAS_ENABLED = True
 FIRST_TRADE_BIAS_WINDOW_MIN = 60      # only applies for first entry within first hour
@@ -1251,11 +1272,17 @@ async def process_ticker(ticker):
         regime = detect_market_regime(df)
         logging.debug(f"[REGIME] {ticker} | regime={regime}")
         
-        # Phase 1 Safety: Hard block NEW ENTRIES during SQUEEZE regime (do not block exit management)
+        # Phase 1 Safety: SQUEEZE handling (soft)
+        # Instead of a hard ban (which can cause zero trades for long periods), we:
+        # - Only block ultra-low volatility squeezes
+        # - Otherwise allow entries but reduce position size later
+        squeeze_soft_block = False
         if regime == "SQUEEZE" and not have_position:
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_REGIME")
-            supabase_log(f"entry_blocked | {ticker} | regime=SQUEEZE")
-            return
+            if pd.isna(atr_pct) or atr_pct < 0.0025:
+                squeeze_soft_block = True
+                logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_TOO_QUIET atr%={atr_pct:.4f}")
+                reason_log(f"squeeze_quiet:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_too_quiet | atr_pct={atr_pct:.4f}")
+                return
 
         # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
         score = calculate_signal_score(
@@ -1377,10 +1404,14 @@ async def process_ticker(ticker):
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=ATR_RANGE atr_pct={atr_pct:.4f}")
             return
 
-        # 3. MACD confirmation – must be rising (momentum building)
+        # 3. MACD confirmation (soft)
+        # The strict "must be rising" check often blocks all entries.
+        # We only block if MACD is clearly deteriorating AND below zero (bearish momentum).
         prev_macd = float(df['MACD'].iloc[-2]) if len(df) > 1 else macd
-        if macd < prev_macd:
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=MACD_FALLING macd={macd:.4f} prev={prev_macd:.4f}")
+        macd_falling_hard = (macd < prev_macd * 0.85) and (macd < 0)
+        if macd_falling_hard:
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=MACD_FALLING_HARD macd={macd:.4f} prev={prev_macd:.4f}")
+            reason_log(f"macd_fall:{ticker}", f"entry_blocked | {ticker} | reason=macd_falling_hard | macd={macd:.4f} prev={prev_macd:.4f}")
             return
 
         momentum_confirmed = (macd >= prev_macd)
@@ -1433,14 +1464,25 @@ async def process_ticker(ticker):
             ):
                 mvt_ok = (score >= MVT_MIN_SCORE)
 
-        if score < threshold and not mvt_ok:
-            # Log near-miss cases (85-100% of threshold) for user transparency
+        # --- Tiered Entry Decision ---
+        tier = None
+
+        if score >= threshold * TIER1_THRESHOLD_MULT:
+            tier = "TIER1"
+        elif score >= threshold * TIER2_THRESHOLD_MULT:
+            tier = "TIER2"
+        elif mvt_ok:
+            tier = "MVT"
+        else:
             if score >= threshold * 0.85:
-                supabase_log(f"entry_blocked | {ticker} | score={score:.2f} < threshold")
+                reason_log(
+                    f"near_miss:{ticker}",
+                    f"entry_blocked | {ticker} | reason=near_miss | score={score:.3f} threshold={threshold:.3f}"
+                )
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LOW_SCORE score={score:.3f} threshold={threshold:.3f} base={base_threshold:.3f} mvt_ok={mvt_ok}")
             return
 
-        if mvt_ok and score < threshold:
+        if tier == "MVT" and score < threshold:
             logging.info(f"[ENTRY ALLOWED:MVT] {ticker} | score={score:.3f} (min={MVT_MIN_SCORE:.3f}) rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open:.0f}")
 
         # 7. Trend acceleration – confirm short‑term momentum (allow flat)
@@ -1456,14 +1498,26 @@ async def process_ticker(ticker):
             return
 
         qty = calculate_position_size(ticker, RISK_PER_TRADE)
+
+        # Tier-based size adjustment
+        if tier == "TIER2":
+            qty = qty * TIER2_SIZE_MULT
+        elif tier == "MVT":
+            qty = qty * 0.40
+
         if qty <= 0:
             return
-            
+
         # Market regime-aware position sizing adjustment
         if regime == "MEAN_REVERSION":
             # Reduce position size by 40% for mean reversion trades (higher risk of false signals)
             qty = qty * 0.6
             logging.debug(f"[REGIME SIZING] {ticker} | MEAN_REVERSION regime - reduced position size by 40%")
+
+        if regime == "SQUEEZE":
+            # SQUEEZE entries are allowed (unless too quiet), but size is reduced to limit risk.
+            qty = qty * 0.5
+            logging.debug(f"[REGIME SIZING] {ticker} | SQUEEZE regime - reduced position size by 50%")
         
         # Phase 1 Safety: Buying power guard
         required_dollars = qty * close_price
@@ -1472,11 +1526,16 @@ async def process_ticker(ticker):
             supabase_log("entry_blocked | insufficient_buying_power")
             return
 
-        reason = "MVT" if (mvt_ok and score < threshold) else ("FIRST_TRADE_BIAS" if (FIRST_TRADE_BIAS_ENABLED and (not SESSION.first_trade_done) and minutes_since_open is not None and minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN) else "NORMAL")
-        logging.info(f"ENTRY {ticker}: {reason} | px={close_price:.2f} qty={qty} score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open if minutes_since_open is not None else 'na'} regime={regime}")
-        
+        # Entry log with tier transparency
+        logging.info(
+            f"ENTRY {ticker} [{tier}] | px={close_price:.2f} qty={qty:.4f} "
+            f"score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} "
+            f"macd_rising={momentum_confirmed} regime={regime}"
+        )
         # Trade intent transparency log
-        supabase_log(f"trade_signal | BUY {ticker} | score={score:.2f} regime={regime}")
+        supabase_log(
+            f"trade_signal | BUY {ticker} | tier={tier} score={score:.2f} regime={regime}"
+        )
 
         if await place_order_async(ticker, qty, 'buy'):
             SESSION.first_trade_done = True

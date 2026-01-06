@@ -151,7 +151,14 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
         logging.error(f"[ERROR] Failed to retrieve assets from Alpaca: {e}")
         assets = []
 
-    tradable = [a.symbol for a in assets if a.tradable and a.symbol.isalpha() and a.exchange in ["NASDAQ", "NYSE"]]
+    tradable = [
+        a.symbol for a in assets
+        if a.tradable
+        and a.asset_class == "us_equity"
+        and a.symbol.isalpha()
+        and len(a.symbol) <= 5
+        and a.exchange in ["NASDAQ", "NYSE"]
+    ]
     logging.debug(f"Total tradable symbols retrieved: {len(tradable)}")
     logging.debug(f"First 10 tradable symbols: {tradable[:10]}")
     volume_filtered = []

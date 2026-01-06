@@ -172,8 +172,9 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                 _mark_bad_data(symbol)
                 continue
 
-            # Guard: ensure sufficient daily history
-            if len(bars) < 5:
+            # Guard: ensure minimal daily history (adaptive for ETFs / structured products)
+            MIN_DAILY_BARS = 2
+            if len(bars) < MIN_DAILY_BARS:
                 logging.warning(f"{symbol} has insufficient daily history ({len(bars)} bars).")
                 _mark_bad_data(symbol)
                 continue
@@ -189,8 +190,12 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             vol = bars.iloc[-1]['volume']
             close = bars.iloc[-1]['close']
             dollar_volume = vol * close
-            # Stronger liquidity filter (reduces garbage symbols)
-            if vol >= 50_000 and dollar_volume >= 1_000_000 and close >= 5.0:
+            # Liquidity filter (adaptive, still avoids junk)
+            MIN_VOL = 25_000
+            MIN_DOLLAR_VOL = 500_000
+            MIN_PRICE = 3.0
+
+            if vol >= MIN_VOL and dollar_volume >= MIN_DOLLAR_VOL and close >= MIN_PRICE:
                 volume_filtered.append(symbol)
         except Exception as e:
             logging.warning(f"Error processing {symbol}: {e}")

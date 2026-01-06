@@ -761,10 +761,15 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
                                       message=error_msg)
                 await log_activity(user_id, mode, f"❌ {error_msg}")
             finally:
-                # Always clean up from registry and AI tracking
-                if key in ACTIVE_BOTS:
-                    del ACTIVE_BOTS[key]
-                    logger.info("Cleaned up task from ACTIVE_BOTS registry: %s", key)
+                # Only remove registry entry if it still points to THIS task (avoids races on restart)
+                try:
+                    current = ACTIVE_BOTS.get(key)
+                    if current is asyncio.current_task():
+                        ACTIVE_BOTS.pop(key, None)
+                        logger.info("Cleaned up task from ACTIVE_BOTS registry: %s", key)
+                except Exception:
+                    # Never let cleanup crash the worker
+                    pass
                 
                 # Clean up AI scan tracking
                 if key in LAST_AI_SCAN_AT:
@@ -786,9 +791,9 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
         """
         key = f"{user_id}:{mode}"
         
-        # Cancel task if it exists
-        if key in ACTIVE_BOTS:
-            task = ACTIVE_BOTS[key]
+        # Cancel task if it exists (idempotent, race-safe)
+        task = ACTIVE_BOTS.pop(key, None)
+        if task is not None:
             if not task.done():
                 logger.info("STOP cancelling running task for %s", key)
                 task.cancel()
@@ -796,9 +801,6 @@ async def worker_loop(poll_interval: int = HEARTBEAT_INTERVAL_SECONDS) -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
-            
-            # Remove from registry
-            del ACTIVE_BOTS[key]
             logger.info("STOP removed task from registry: %s", key)
             await log_activity(user_id, mode, "Task cancelled and cleaned from registry")
         else:

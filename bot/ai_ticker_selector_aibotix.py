@@ -133,6 +133,13 @@ async def fetch_indicators(symbol: str, mode: str):
         df['gap'] = df['close'] / df['close'].shift(1) - 1
         df['slope'] = df['close'].rolling(window=5).apply(lambda x: (x.iloc[-1] - x.iloc[0]) / 5)
 
+        # Intraday liquidity validation (real money flow)
+        recent_volume = df['volume'].iloc[-20:].sum()
+        if recent_volume < 50_000:
+            logging.info(f"{symbol} rejected - insufficient intraday liquidity.")
+            _mark_bad_data(symbol)
+            return None
+
         return df
     except Exception as e:
         logging.warning(f"Fetch failed for {symbol}: {e}")
@@ -194,15 +201,12 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                     f"Dollar Volume: {bars.iloc[-1]['volume'] * bars.iloc[-1]['close']}"
                 )
 
-            vol = bars.iloc[-1]['volume']
+            # Daily bars are unreliable intraday for liquidity.
+            # Only perform basic price sanity check here.
             close = bars.iloc[-1]['close']
-            dollar_volume = vol * close
-            # Liquidity filter (adaptive, still avoids junk)
-            MIN_VOL = 25_000
-            MIN_DOLLAR_VOL = 500_000
             MIN_PRICE = 3.0
 
-            if vol >= MIN_VOL and dollar_volume >= MIN_DOLLAR_VOL and close >= MIN_PRICE:
+            if close >= MIN_PRICE:
                 volume_filtered.append(symbol)
         except Exception as e:
             logging.warning(f"Error processing {symbol}: {e}")

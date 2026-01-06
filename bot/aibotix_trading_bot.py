@@ -147,6 +147,34 @@ def reason_log(key: str, message: str, min_seconds: int = 120) -> None:
     _last_reason_log[key] = now
     supabase_log(message)
 
+def ui_log(key: str, message: str, min_seconds: int = 60) -> None:
+    """Rate-limited user-friendly log message."""
+    try:
+        reason_log(f"ui_{key}", f"ui | {message}", min_seconds=min_seconds)
+    except Exception:
+        pass  # Never block trading on UI log failures
+
+def ui_event(message: str) -> None:
+    """Immediate user-friendly event message."""
+    try:
+        supabase_log(f"ui | {message}")
+    except Exception:
+        pass  # Never block trading on UI log failures
+
+# --- Clean user-facing heartbeat (1 per minute max) ---
+_last_user_minute_log = {}
+
+def user_minute_log(message: str):
+    key = f"{SESSION.USER_ID}:{SESSION.CURRENT_MODE}"
+    now = datetime.datetime.now(ny_tz)
+
+    last = _last_user_minute_log.get(key)
+    if last and (now - last).total_seconds() < 60:
+        return
+
+    _last_user_minute_log[key] = now
+    supabase_log(f"ui | {message}")
+
 load_dotenv()
 
 API_KEY = None
@@ -272,6 +300,7 @@ def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_
 
     logging.info(f"[Client Init] mode={effective_mode} paper={paper_mode}")
     supabase_log(f"client_initialised | mode={effective_mode} | paper={paper_mode}")
+    ui_event(f"Trading client connected in {effective_mode} mode.")
 
     return api
 
@@ -572,6 +601,10 @@ def place_order(symbol, qty, side):
         supabase_log(
             f"order_submitted | {side.upper()} {symbol} qty={qty} @ {datetime.datetime.now(ny_tz).isoformat()}"
         )
+        
+        # --- UI notification for BUY orders ---
+        if side.lower() == 'buy':
+            ui_event(f"Order placed: BUY {symbol}. Position opened.")
 
         if side.lower() == 'sell':
             SESSION.trade_history[symbol] = SESSION.trade_history.get(symbol, {})
@@ -625,6 +658,11 @@ def close_position(symbol):
         supabase_log(
             f"position_closed | {symbol} | pnl={pnl:.2f} @ {datetime.datetime.now(ny_tz).isoformat()}"
         )
+        
+        # --- UI notification ---
+        profit_loss = "profit" if pnl >= 0 else "loss"
+        ui_event(f"Position closed: {symbol} with ${pnl:.2f} {profit_loss}.")
+        
         # === Smart Ticker Recovery Lock (loss-based) ===
         if pnl < 0:
             state = _get_recovery_state(symbol)
@@ -775,6 +813,10 @@ def update_pnl():
     supabase_log(
         f"pnl_update | realized={SESSION.realized_pnl:.2f} unrealized={SESSION.unrealized_pnl:.2f} equity={get_equity():.2f}"
     )
+    
+    # Rate-limited equity update for users
+    current_equity = get_equity()
+    # ui_log("equity_update", f"Equity update: ${current_equity:.2f} (Realized ${SESSION.realized_pnl:.2f})")
 
 # Patch 2.1: Add async wrapper for P&L update
 async def update_pnl_async():
@@ -818,6 +860,16 @@ def calculate_position_size(symbol, risk_per_trade):
     effective_max_dollars = min(max_dollars_per_ticker, max_dollars_per_trade)
     if current_price > 0:
         raw_qty = min(raw_qty, effective_max_dollars / current_price)
+
+    # Never allow position size to exceed available buying power
+    account = get_account()
+    if account is not None:
+        try:
+            buying_power = float(account.buying_power)
+            max_qty_by_bp = buying_power / current_price if current_price > 0 else 0.0
+            raw_qty = min(raw_qty, max_qty_by_bp)
+        except Exception:
+            pass
 
     return round(float(raw_qty), 4)
 
@@ -1070,6 +1122,7 @@ async def close_all_positions():
 def request_bot_stop():
     # --- Supabase log bot stop requested ---
     supabase_log(f"bot_stop_requested @ {datetime.datetime.now(ny_tz).isoformat()}")
+    ui_event("Bot stop requested. Shutting down safely…")
     logging.info("Bot stop requested; worker will cancel trade_loop_async task.")
 
 async def wait_until_market_open_or_preopen(preopen_minutes: int = 10):
@@ -1124,6 +1177,7 @@ async def trade_loop_async(allowed_tickers=None):
 
         if state == "open":
             logging.info("Market open detected — entering trading loop immediately.")
+            ui_event("Market is open. Bot is now actively monitoring the market.")
             # Capture market open timestamp for "first trade bias" + MVT timing guards
             try:
                 clock = await asyncio.to_thread(SESSION.api.get_clock)
@@ -1163,6 +1217,8 @@ async def trade_loop_async(allowed_tickers=None):
     last_heartbeat_log = ny_now()
     while True:
         try:
+            user_minute_log("Bot running — scanning market for opportunities")
+            
             # Step 3: daily resets & halts
             reset_daily_limits_if_new_day()
             if should_halt_trading():
@@ -1176,11 +1232,13 @@ async def trade_loop_async(allowed_tickers=None):
             now = ny_now()
             if (now - last_heartbeat_log).total_seconds() > 120:
                 supabase_log("bot_heartbeat | phase1_safety_active")
+                # ui_log("heartbeat", "Bot is actively scanning for opportunities…")
                 last_heartbeat_log = now
             # === Intelligent 30-Minute AI Ticker Refresh ===
             now = ny_now()
             if allowed_tickers is None and (now - last_ticker_refresh).total_seconds() > 1800:  # 30 minutes
                 logging.info("Running 30-minute AI ticker refresh...")
+                # ui_log("ai_refresh", "Refreshing AI watchlist…")
 
                 # Fetch new AI tickers
                 new_ai_tickers = await asyncio.to_thread(
@@ -1192,6 +1250,7 @@ async def trade_loop_async(allowed_tickers=None):
 
                 if not new_ai_tickers:
                     logging.warning("AI Ticker Selector returned no tickers. Keeping existing set.")
+                    # ui_log("ai_refresh_empty", "No stronger opportunities found. Keeping current watchlist.")
                     last_ticker_refresh = now
                 else:
                     # Fetch open positions
@@ -1371,8 +1430,10 @@ async def trade_loop_async(allowed_tickers=None):
             # Scan cycle summary (user transparency)
             if entries_attempted == 0:
                 supabase_log("scan_complete | no_valid_entries")
+                # ui_log("scan_complete", "Scan complete — no trade opportunities met safety criteria.")
             elif entries_attempted > 0:
                 supabase_log("scan_complete | entries_rejected=filters")
+                # ui_log("scan_complete", "Scan complete — opportunities reviewed and filtered by risk checks.")
 
             if SESSION.consecutive_losses >= 3:
                 logging.warning(f"Cooldown triggered due to 3 losses. Waiting {LOSS_COOLDOWN} seconds...")
@@ -1456,6 +1517,7 @@ async def process_ticker(ticker):
                 squeeze_soft_block = True
                 logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_TOO_QUIET atr%={atr_pct:.4f}")
                 reason_log(f"squeeze_quiet:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_too_quiet | atr_pct={atr_pct:.4f}")
+                # ui_log(f"entry_block_{ticker}", f"{ticker}: Entry blocked — volatility too quiet for safe trading.")
                 return
 
         # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
@@ -1724,6 +1786,11 @@ async def process_ticker(ticker):
         if not has_sufficient_buying_power(required_dollars):
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=INSUFFICIENT_BUYING_POWER required=${required_dollars:.2f}")
             supabase_log("entry_blocked | insufficient_buying_power")
+            # ui_log(
+            #     f"bp_{ticker}",
+            #     f"{ticker}: Entry skipped — insufficient buying power.",
+            #     min_seconds=120
+            # )
             return
 
         # Entry log with tier transparency
@@ -1736,6 +1803,7 @@ async def process_ticker(ticker):
         supabase_log(
             f"trade_signal | BUY {ticker} | tier={tier} score={score:.2f} regime={regime}"
         )
+        ui_event(f"Signal found: BUY setup for {ticker}. Attempting entry…")
 
         if await place_order_async(ticker, qty, 'buy'):
             SESSION.first_trade_done = True

@@ -186,12 +186,9 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                 _mark_bad_data(symbol)
                 continue
 
-            # Guard: ensure minimal daily history (adaptive for ETFs / structured products)
-            MIN_DAILY_BARS = 2
-            if len(bars) < MIN_DAILY_BARS:
-                logging.warning(f"{symbol} has insufficient daily history ({len(bars)} bars).")
-                _mark_bad_data(symbol)
-                continue
+            # NOTE: During market hours Alpaca often returns only the current in-progress daily bar.
+            # That is normal and should NOT exclude a symbol from screening.
+            # We only treat DAILY bars as a light sanity check (e.g., price >= MIN_PRICE).
 
             # Now it's safe to inspect the last bar for debug logging
             if len(volume_filtered) < 5:
@@ -213,7 +210,7 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             continue
 
     logging.info(f"[DEBUG] First 10 failed symbols: {failed_symbols[:10]}")
-    logging.info(f"{len(volume_filtered)} tickers passed relaxed volume filter.")
+    logging.info(f"{len(volume_filtered)} tickers passed relaxed pre-screen filter.")
     random.shuffle(volume_filtered)
 
     indicator_results = []
@@ -222,7 +219,7 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
     symbols_for_indicators = volume_filtered[:MAX_INDICATOR_TASKS]
 
     if not symbols_for_indicators:
-        logging.warning("No symbols passed the volume filter; returning empty indicator results.")
+        logging.warning("No symbols passed the pre-screen filter; returning empty indicator results.")
         return []
 
     tasks = [fetch_indicators(sym, mode) for sym in symbols_for_indicators]

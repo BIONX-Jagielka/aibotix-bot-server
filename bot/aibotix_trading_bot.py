@@ -35,6 +35,9 @@ class BotSession:
         # Smart Ticker Recovery Lock (per-ticker)
         self.ticker_recovery_lock = {}
         
+        # Execution-level bad data suppression
+        self.bad_ticker_until = {}   # ticker -> datetime until which ticker is skipped
+        
         # Defensive logic state
         self.session_peak_equity = None
         self.buy_pause_until = None
@@ -155,6 +158,9 @@ BASE_URL = 'https://paper-api.alpaca.markets'  # use live URL for real trading
 # TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
 TICKERS = []
 RSI_PERIOD = 14
+
+# Minimum bars required for safe indicator calculation
+MIN_BARS_REQUIRED = max(RSI_PERIOD + 5, 50)
 MAX_DRAWDOWN = 0.10  # 10%
 MAX_TRADES_PER_HOUR = 5
 MAX_TICKER_EXPOSURE = 0.30  # 30% of equity
@@ -498,6 +504,17 @@ def ny_now():
     """Shorthand for now in NY timezone."""
     return datetime.datetime.now(ny_tz)
 
+def mark_exec_bad_ticker(ticker: str, reason: str):
+    # Defensive guard for future refactors / early calls
+    if not hasattr(SESSION, "bad_ticker_until"):
+        return
+    until = ny_now() + datetime.timedelta(minutes=EXEC_BAD_TICKER_COOLDOWN_MIN)
+    SESSION.bad_ticker_until[ticker] = until
+    reason_log(
+        f"exec_bad:{ticker}",
+        f"ticker_exec_locked | {ticker} | reason={reason} | until={until.isoformat()}"
+    )
+
 # --- Trading Logic ---
 class RateLimitError(Exception):
     pass
@@ -837,6 +854,13 @@ def fetch_data(symbol):
             return None
 
         df = df.sort_index()
+        
+        # Guard: ensure enough bars before indicator calculation
+        if df is None or df.empty or len(df) < MIN_BARS_REQUIRED:
+            logging.warning(f"{symbol}: insufficient bars ({0 if df is None else len(df)}).")
+            mark_exec_bad_ticker(symbol, "insufficient_bars")
+            return None
+        
         df = strategy.calculate_indicators(df.copy())
         df['RSI'] = df['RSI'].interpolate().bfill()
         df['ATR'] = df['ATR'].interpolate().bfill()
@@ -850,7 +874,8 @@ def fetch_data(symbol):
 
         return df
     except Exception as e:
-        logging.error(f"{symbol}: Error fetching bars - {e}")
+        logging.error(f"{symbol}: Data/indicator failure - {e}")
+        mark_exec_bad_ticker(symbol, "indicator_exception")
         return None
 
 # Convert fetch_data to an asynchronous function
@@ -893,7 +918,9 @@ MAX_ATR_PCT = 0.09    # 9% of price
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
-MIN_BARS_REQUIRED = max(RSI_PERIOD + 5, 50)  # ensure enough data for indicators
+
+# --- Execution-level data hygiene ---
+EXEC_BAD_TICKER_COOLDOWN_MIN = 45   # minutes to ignore tickers with bad/insufficient data
 
 # === Trade activity tuning (safe) ===
 MVT_ENABLED = True
@@ -1311,8 +1338,8 @@ async def trade_loop_async(allowed_tickers=None):
             hour_start = ny_now()
 
             if not SESSION.TICKERS and not SESSION.ACTIVE_TICKERS:
-                logging.warning("Both SESSION.TICKERS and SESSION.ACTIVE_TICKERS empty. Waiting 60s...")
-                await asyncio.sleep(60)
+                logging.warning("Both SESSION.TICKERS and SESSION.ACTIVE_TICKERS empty. Waiting 5 minutes...")
+                await asyncio.sleep(300)
                 continue
 
             tasks = []
@@ -1370,12 +1397,19 @@ async def trade_loop_async(allowed_tickers=None):
 async def process_ticker(ticker):
     try:
         await asyncio.sleep(random.uniform(0.2, 0.6))
+        
+        # Execution-level bad ticker cooldown
+        bad_until = SESSION.bad_ticker_until.get(ticker)
+        if bad_until and ny_now() < bad_until:
+            return
+        
         # Respect global halts
         if should_halt_trading():
             return
 
         df = await fetch_data_async(ticker)
         if df is None or len(df) < MIN_BARS_REQUIRED:
+            mark_exec_bad_ticker(ticker, "fetch_failed_or_short")
             return
 
         # Latest values

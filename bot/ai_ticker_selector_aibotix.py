@@ -146,21 +146,21 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
     try:
         assets = trading_client.get_all_assets()
         assets = [a for a in assets if a.status == 'active']
-        logging.info(f"[DEBUG] Retrieved {len(assets)} active assets from Alpaca.")
+        logging.debug(f"Retrieved {len(assets)} active assets from Alpaca.")
     except Exception as e:
         logging.error(f"[ERROR] Failed to retrieve assets from Alpaca: {e}")
         assets = []
 
     tradable = [a.symbol for a in assets if a.tradable and a.symbol.isalpha() and a.exchange in ["NASDAQ", "NYSE"]]
-    logging.info(f"[DEBUG] Total tradable symbols retrieved: {len(tradable)}")
-    logging.info(f"[DEBUG] First 10 tradable symbols: {tradable[:10]}")
+    logging.debug(f"Total tradable symbols retrieved: {len(tradable)}")
+    logging.debug(f"First 10 tradable symbols: {tradable[:10]}")
     volume_filtered = []
     for symbol in tradable[:MAX_TRADABLE_SCREEN]:
         if _is_in_bad_data_cooldown(symbol):
             continue
         try:
-            logging.info(f"Checking symbol: {symbol}")
-            d_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=1)
+            logging.debug(f"Checking symbol: {symbol}")
+            d_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=5)
             bars = data_client.get_stock_bars(d_req).df
 
             # If no data, mark as failed and skip *before* trying to access bars.iloc[-1]
@@ -172,10 +172,16 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                 _mark_bad_data(symbol)
                 continue
 
+            # Guard: ensure sufficient daily history
+            if len(bars) < 5:
+                logging.warning(f"{symbol} has insufficient daily history ({len(bars)} bars).")
+                _mark_bad_data(symbol)
+                continue
+
             # Now it's safe to inspect the last bar for debug logging
             if len(volume_filtered) < 5:
-                logging.info(
-                    f"[DEBUG] {symbol} - Volume: {bars.iloc[-1]['volume']}, "
+                logging.debug(
+                    f"{symbol} - Volume: {bars.iloc[-1]['volume']}, "
                     f"Close: {bars.iloc[-1]['close']}, "
                     f"Dollar Volume: {bars.iloc[-1]['volume'] * bars.iloc[-1]['close']}"
                 )

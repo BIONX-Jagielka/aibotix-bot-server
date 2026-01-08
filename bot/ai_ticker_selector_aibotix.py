@@ -77,7 +77,7 @@ RSI_PERIOD = 14
 
 # Limits to control how many symbols we screen each run
 MAX_TRADABLE_SCREEN = 250  # how many symbols to volume-screen
-MAX_INDICATOR_TASKS = 60   # how many symbols to fetch intraday indicators for
+MAX_INDICATOR_TASKS = 120   # how many symbols to fetch intraday indicators for
 
 # --- Bad data memory (prevents re-scanning symbols with no bars) ---
 BAD_DATA_COOLDOWN_SECONDS = 6 * 60 * 60  # 6 hours
@@ -137,7 +137,6 @@ async def fetch_indicators(symbol: str, mode: str):
         recent_volume = df['volume'].iloc[-20:].sum()
         if recent_volume < 50_000:
             logging.info(f"{symbol} rejected - insufficient intraday liquidity.")
-            _mark_bad_data(symbol)
             return None
 
         return df
@@ -333,7 +332,7 @@ def unified_ai_score(
 
     return score
 
-def score_tickers(indicator_results, mode: str, top_n: int = 5):
+def score_tickers(indicator_results, mode: str, top_n: int = 30):
     """
     Score tickers using the unified multi-factor model so that
     live AI screening is aligned with the trading bot's signal logic.

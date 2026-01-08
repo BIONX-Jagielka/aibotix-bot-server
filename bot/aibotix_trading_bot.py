@@ -1186,7 +1186,7 @@ async def trade_loop_async(allowed_tickers=None):
             logging.info("Pre-open phase: running AI ticker selector early.")
             selected_tickers = await asyncio.to_thread(
                 get_top_tickers,
-                5,
+                30,
                 SESSION.USER_ID,
                 SESSION.CURRENT_MODE
             )
@@ -1216,7 +1216,7 @@ async def trade_loop_async(allowed_tickers=None):
     if not SESSION.TICKERS and allowed_tickers is None:
         selected_tickers = await asyncio.to_thread(
             get_top_tickers,
-            5,
+            30,
             SESSION.USER_ID,
             SESSION.CURRENT_MODE
         )
@@ -1265,7 +1265,7 @@ async def trade_loop_async(allowed_tickers=None):
                 # Fetch new AI tickers
                 new_ai_tickers = await asyncio.to_thread(
                     get_top_tickers,
-                    5,
+                    30,
                     SESSION.USER_ID,
                     SESSION.CURRENT_MODE
                 )

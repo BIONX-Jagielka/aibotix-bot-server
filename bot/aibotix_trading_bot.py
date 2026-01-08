@@ -192,6 +192,7 @@ MIN_BARS_REQUIRED = max(RSI_PERIOD + 5, 50)
 MAX_DRAWDOWN = 0.10  # 10%
 MAX_TRADES_PER_HOUR = 5
 MAX_TICKER_EXPOSURE = 0.30  # 30% of equity
+MAX_CONCURRENT_POSITIONS = 5
 
 # --- Position sizing safety caps (prevents oversized notional trades) ---
 # Cap any single trade notional to a small slice of equity AND an absolute ceiling.
@@ -493,6 +494,14 @@ def get_account():
         logging.error("Trading client not initialised. Cannot proceed.")
         return None
     return api_instance.get_account()
+
+def get_open_position_count():
+    if SESSION.api is None:
+        return 0
+    try:
+        return len(SESSION.api.get_all_positions())
+    except Exception:
+        return 0
 
 def get_equity():
     account = get_account()
@@ -873,6 +882,18 @@ def calculate_position_size(symbol, risk_per_trade):
 
     return round(float(raw_qty), 4)
 
+def scale_qty_by_score(qty, score):
+    if score is None:
+        return 0.0
+    if score < 0.30:
+        return qty * 0.25
+    elif score < 0.45:
+        return qty * 0.50
+    elif score < 0.65:
+        return qty * 0.75
+    else:
+        return qty
+
 def fetch_data(symbol):
     global data_client
     if data_client is None:
@@ -957,6 +978,7 @@ INDICATOR_WEIGHTS = {
 # --- Signal thresholds & trade guards ---
 SIGNAL_BUY_THRESHOLD = 0.20   # how strong the combined signal must be to enter
 SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
+MICRO_PROFIT_TAKE = 0.001   # 0.10% fast profit snap exit
 
 # === Tiered Execution Thresholds ===
 TIER1_THRESHOLD_MULT = 1.00   # full confidence
@@ -1549,6 +1571,14 @@ async def process_ticker(ticker):
             BASE_TP         = 0.03    # 3%
             EXT_TP          = 0.05    # 5%
 
+            # Micro-profit snap exit (fast profit lock)
+            if pnl_pct >= MICRO_PROFIT_TAKE:
+                pnl = close_position(ticker)
+                SESSION.recently_traded[ticker] = ny_now()
+                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                supabase_log(f"micro_tp_exit | {ticker} | pnl={pnl_pct:.2%}")
+                return
+
             # 1. Faster defensive loss exit at -0.3%
             if pnl_pct <= -0.003:
                 pnl = close_position(ticker)
@@ -1628,6 +1658,10 @@ async def process_ticker(ticker):
         ):
             return
         # ================ ENTRY LOGIC (if flat) ================
+        # Max concurrent positions safety guard
+        if get_open_position_count() >= MAX_CONCURRENT_POSITIONS:
+            return
+            
         # Defensive mode: Check if BUY entries are paused
         if SESSION.buy_pause_until:
             if datetime.datetime.now(ny_tz) < SESSION.buy_pause_until:
@@ -1766,6 +1800,9 @@ async def process_ticker(ticker):
             qty = qty * TIER2_SIZE_MULT
         elif tier == "MVT":
             qty = qty * 0.40
+        
+        # Scale quantity based on signal score
+        qty = scale_qty_by_score(qty, score)
 
         if qty <= 0:
             return

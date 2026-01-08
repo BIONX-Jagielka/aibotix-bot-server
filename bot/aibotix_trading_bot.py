@@ -175,6 +175,20 @@ def user_minute_log(message: str):
     _last_user_minute_log[key] = now
     supabase_log(f"ui | {message}")
 
+# --- Clean user-facing heartbeat (1 per 5 minutes max) ---
+_last_user_five_min_log = {}
+
+def user_five_min_log(message: str):
+    key = f"{SESSION.USER_ID}:{SESSION.CURRENT_MODE}"
+    now = datetime.datetime.now(ny_tz)
+
+    last = _last_user_five_min_log.get(key)
+    if last and (now - last).total_seconds() < 300:
+        return
+
+    _last_user_five_min_log[key] = now
+    supabase_log(f"ui | {message}")
+
 load_dotenv()
 
 API_KEY = None
@@ -1240,6 +1254,7 @@ async def trade_loop_async(allowed_tickers=None):
     while True:
         try:
             user_minute_log("Bot running — scanning market for opportunities")
+            user_five_min_log("Bot active — scanning market and evaluating AI signals")
             
             # Step 3: daily resets & halts
             reset_daily_limits_if_new_day()

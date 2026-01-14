@@ -206,7 +206,7 @@ MIN_BARS_REQUIRED = max(RSI_PERIOD + 5, 50)
 MAX_DRAWDOWN = 0.10  # 10%
 MAX_TRADES_PER_HOUR = 5
 MAX_TICKER_EXPOSURE = 0.30  # 30% of equity
-MAX_CONCURRENT_POSITIONS = 5
+MAX_CONCURRENT_POSITIONS = 30
 
 # --- Position sizing safety caps (prevents oversized notional trades) ---
 # Cap any single trade notional to a small slice of equity AND an absolute ceiling.
@@ -850,6 +850,12 @@ def calculate_position_size(symbol, risk_per_trade):
     equity = get_equity()
     # Use only equity after reserving safety buffer
     usable_equity = max(equity * (1 - RESERVE_FUND_PCT), 0)
+    
+    # Capital scaling for multiple concurrent positions
+    MAX_CAPITAL_USAGE = 0.95  # keep safety reserve
+    available_capital = equity * MAX_CAPITAL_USAGE
+    per_trade_capital = available_capital / MAX_CONCURRENT_POSITIONS
+    
     max_risk = max(usable_equity * risk_per_trade, 0.01)  # ensure a tiny non-zero risk budget
 
     df = fetch_data(symbol)
@@ -878,9 +884,15 @@ def calculate_position_size(symbol, risk_per_trade):
     max_dollars_per_trade = usable_equity * MAX_TRADE_NOTIONAL_PCT if MAX_TRADE_NOTIONAL_PCT else max_dollars_per_ticker
     if MAX_TRADE_NOTIONAL_ABS is not None:
         max_dollars_per_trade = min(max_dollars_per_trade, float(MAX_TRADE_NOTIONAL_ABS))
+    
+    # Apply capital scaling for concurrent positions
+    trade_capital = min(
+        per_trade_capital,
+        max_dollars_per_trade  # existing safety cap
+    )
 
     # Apply both caps
-    effective_max_dollars = min(max_dollars_per_ticker, max_dollars_per_trade)
+    effective_max_dollars = min(max_dollars_per_ticker, trade_capital)
     if current_price > 0:
         raw_qty = min(raw_qty, effective_max_dollars / current_price)
 
@@ -1366,7 +1378,7 @@ async def trade_loop_async(allowed_tickers=None):
                                 continue
 
                             # Check if candidate is clearly stronger than weakest current
-                            if len(active) < 5:
+                            if len(active) < 15:
                                 active.append(candidate)
                             else:
                                 weakest_sym = None
@@ -1586,8 +1598,8 @@ async def process_ticker(ticker):
             BASE_TP         = 0.03    # 3%
             EXT_TP          = 0.05    # 5%
 
-            # Micro-profit snap exit (fast profit lock)
-            if pnl_pct >= MICRO_PROFIT_TAKE:
+            # Micro-profit snap exit (fast profit lock), skip for high-confidence trades
+            if pnl_pct >= MICRO_PROFIT_TAKE and score < SIGNAL_BUY_THRESHOLD * 1.25:
                 pnl = close_position(ticker)
                 SESSION.recently_traded[ticker] = ny_now()
                 SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()

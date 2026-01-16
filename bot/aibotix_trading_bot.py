@@ -1510,6 +1510,11 @@ async def process_ticker(ticker):
         # Sentiment (placeholder currently returns 0)
         sentiment = await get_sentiment_score(ticker)
 
+        # Partial entry constants
+        PARTIAL_ENTRY_ENABLED = True
+        PARTIAL_ENTRY_SCORE_FLOOR = 0.14      # minimum score to allow partial entry
+        PARTIAL_ENTRY_MULTIPLIER = 0.25       # 25% of normal size
+
         # Detect market regime for adaptive strategy
         regime = detect_market_regime(df)
         logging.debug(f"[REGIME] {ticker} | regime={regime}")
@@ -1754,6 +1759,12 @@ async def process_ticker(ticker):
             tier = "TIER2"
         elif mvt_ok:
             tier = "MVT"
+        elif (
+            PARTIAL_ENTRY_ENABLED
+            and score >= PARTIAL_ENTRY_SCORE_FLOOR
+            and score < threshold * TIER2_THRESHOLD_MULT
+        ):
+            tier = "PARTIAL"
         else:
             if score >= threshold * 0.85:
                 reason_log(
@@ -1785,6 +1796,8 @@ async def process_ticker(ticker):
             qty = qty * TIER2_SIZE_MULT
         elif tier == "MVT":
             qty = qty * 0.40
+        elif tier == "PARTIAL":
+            qty = qty * PARTIAL_ENTRY_MULTIPLIER
         
         # Scale quantity based on signal score
         qty = scale_qty_by_score(qty, score)
@@ -1816,6 +1829,11 @@ async def process_ticker(ticker):
             return
 
         # Entry log with tier transparency
+        if tier == "PARTIAL":
+            logging.info(
+                f"ENTRY {ticker} [PARTIAL] | score={score:.3f} threshold={threshold:.3f} qty={qty:.4f}"
+            )
+        
         logging.info(
             f"ENTRY {ticker} [{tier}] | px={close_price:.2f} qty={qty:.4f} "
             f"score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} "

@@ -135,7 +135,7 @@ async def fetch_indicators(symbol: str, mode: str):
 
         # Intraday liquidity validation (real money flow)
         recent_volume = df['volume'].iloc[-20:].sum()
-        if recent_volume < 50_000:
+        if recent_volume < 15_000:
             logging.info(f"{symbol} rejected - insufficient intraday liquidity.")
             return None
 
@@ -301,20 +301,23 @@ def unified_ai_score(
 
     score = 0.0
 
-    # 1) RSI: prefer 40–60, softly accept 30–70, penalise extremes
-    if 30 <= rsi <= 75:
-        # bell-shaped preference around 50
-        score += max(0.0, 1.5 - abs(rsi - 50) / 15.0)
+    # 1) RSI: prefer 40–60, softly accept 25–80, only penalise extremes
+    if 25 <= rsi <= 80:
+        # bell-shaped preference around 50, but no penalty for moderate ranges
+        if 40 <= rsi <= 60:
+            score += 1.5 - abs(rsi - 50) / 15.0
+        else:
+            score += 0.3  # small bonus for acceptable range
     else:
-        score -= 0.5
+        score -= 0.5  # penalty only for extreme RSI
 
     # 2) ATR: prefer non-crazy volatility (smaller ATR is safer, but not zero)
     atr_clamped = min(max(atr, 0.01), 5.0)
     score += 0.5 / atr_clamped
 
-    # 3) EMA crossover: bullish alignment
+    # 3) EMA crossover: bullish alignment (bonus, not decisive)
     if ema_crossover:
-        score += 1.0
+        score += 0.5
 
     # 4) Volume ratio: prefer above-average volume, cap contribution
     if volume_ratio > 1.0:
@@ -586,10 +589,12 @@ if __name__ == "__main__":
 
 def get_top_tickers(limit: int, user_id: str, mode: str):
     """
-    Central AI selection function.
+    Central AI selection function with breadth targets and stability.
 
     - Runs stage_a_screen_and_collect(mode) to compute indicators + scores.
     - Sorts results by 'score' (highest first).
+    - Ensures at least min(limit, 20) symbols are returned.
+    - Implements light continuity logic for 40-60% overlap with previous tickers.
     - Writes the top N tickers into the ai_tickers table (row-based).
     - Returns the ordered list of ticker symbols for the worker.
 
@@ -600,6 +605,10 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
     if not supabase:
         logging.warning("[AI-Tickers] Supabase client not configured — returning empty ticker list.")
         return []
+
+    # Fetch previously saved tickers for continuity
+    previous_tickers = fetch_ai_tickers(user_id, mode)
+    min_breadth_target = min(limit, 20)
 
     # --- Step 1: compute scores via the async pipeline ---
     try:
@@ -618,13 +627,61 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
         logging.warning("Indicator results contained no valid scores.")
         return []
 
-    # Sort by score descending and take top 'limit'
-    scored_sorted = sorted(scored, key=lambda r: r["score"], reverse=True)[:limit]
+    # Sort by score descending
+    scored_sorted = sorted(scored, key=lambda r: r["score"], reverse=True)
+
+    # --- Step 2: Implement stability logic (40-60% overlap preservation) ---
+    final_selection = []
+    used_symbols = set()
+    
+    # First, preserve high-quality previous tickers that still pass basic validity
+    if previous_tickers:
+        previous_valid = []
+        for prev_symbol in previous_tickers:
+            # Check if the previous symbol is still in our current results
+            for result in scored_sorted:
+                if result.get("symbol") == prev_symbol:
+                    previous_valid.append(result)
+                    break
+        
+        # Preserve up to 60% of target from previous selection (stability)
+        preserve_count = min(len(previous_valid), int(limit * 0.6))
+        for i in range(preserve_count):
+            if previous_valid[i]["symbol"] not in used_symbols:
+                final_selection.append(previous_valid[i])
+                used_symbols.add(previous_valid[i]["symbol"])
+
+    # Fill remaining slots with new high-scoring tickers
+    for result in scored_sorted:
+        symbol = result.get("symbol")
+        if not symbol or symbol in used_symbols:
+            continue
+            
+        final_selection.append(result)
+        used_symbols.add(symbol)
+        
+        # Stop when we reach our limit
+        if len(final_selection) >= limit:
+            break
+
+    # --- Step 3: Ensure minimum breadth target is met ---
+    if len(final_selection) < min_breadth_target and len(scored_sorted) >= min_breadth_target:
+        # Fill remaining slots with any available scored tickers
+        for result in scored_sorted:
+            symbol = result.get("symbol")
+            if not symbol or symbol in used_symbols:
+                continue
+                
+            final_selection.append(result)
+            used_symbols.add(symbol)
+            
+            if len(final_selection) >= min_breadth_target:
+                break
 
     rows = []
     tickers = []
 
-    for idx, r in enumerate(scored_sorted, start=1):
+    for idx, r in enumerate(final_selection, start=1):
         symbol = r.get("symbol")
         if not symbol:
             continue
@@ -646,7 +703,12 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
         logging.warning("No valid rows produced by get_top_tickers.")
         return []
 
-    # --- Step 2: overwrite ai_tickers for this user/mode ---
+    # Log stability metrics
+    overlap_count = len(set(tickers) & set(previous_tickers)) if previous_tickers else 0
+    overlap_pct = (overlap_count / len(previous_tickers) * 100) if previous_tickers else 0
+    logging.info(f"[AI-Stability] Selected {len(tickers)} tickers with {overlap_count}/{len(previous_tickers) if previous_tickers else 0} overlap ({overlap_pct:.1f}%)")
+
+    # --- Step 4: overwrite ai_tickers for this user/mode ---
     try:
         supabase.table("ai_tickers").delete().match({
             "user_id": user_id,

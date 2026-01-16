@@ -12,7 +12,6 @@ class BotSession:
         self.data_client = None
 
         # Core trading state
-        self.TICKERS = []
         self.consecutive_losses = 0
         self.last_trade_time = {}
         self.realized_pnl = 0.0
@@ -41,6 +40,19 @@ class BotSession:
         # Defensive logic state
         self.session_peak_equity = None
         self.buy_pause_until = None
+        
+        # Market session state + hard gates
+        self.market_state = "UNKNOWN"  # OPEN | CLOSING | CLOSED | PREOPEN
+        self.market_close_guard_until = None  # datetime; used to suppress trading after close sequence starts
+        self.last_clock_check = None
+        self.last_market_state_log = None
+        
+        # AI ticker management
+        self.last_ai_refresh = None
+        self.last_pnl_update = None
+        
+        # Ticker evaluation throttling
+        self.last_ticker_eval = {}  # ticker -> datetime
 
 # Multi-user session registry: one BotSession per (user_id, mode)
 SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
@@ -174,6 +186,25 @@ def user_minute_log(message: str):
 
     _last_user_minute_log[key] = now
     supabase_log(f"ui | {message}")
+
+def get_market_state() -> tuple[str, datetime.timedelta | None]:
+    """Get current market state using SESSION.api.get_clock()"""
+    if SESSION.api is None:
+        return "CLOSED", None
+    
+    try:
+        clock = SESSION.api.get_clock()
+        if clock.is_open:
+            time_to_close = clock.next_close - clock.timestamp if hasattr(clock, 'next_close') else None
+            return "OPEN", time_to_close
+        else:
+            return "CLOSED", None
+    except Exception:
+        return "CLOSED", None
+
+def in_closeout_window(time_to_close: datetime.timedelta | None) -> bool:
+    """Returns True if time_to_close is not None and <= 15 minutes"""
+    return time_to_close is not None and time_to_close <= datetime.timedelta(minutes=15)
 
 # --- Clean user-facing heartbeat (1 per 5 minutes max) ---
 _last_user_five_min_log = {}
@@ -833,9 +864,7 @@ def update_pnl():
             supabase_log(f"defensive_mode | buy_paused_10min | drawdown={drawdown_pct:.2%}")
     
     # Optional: lightweight log line into bot_logs (does not assume bot_status schema)
-    supabase_log(
-        f"pnl_update | realized={SESSION.realized_pnl:.2f} unrealized={SESSION.unrealized_pnl:.2f} equity={get_equity():.2f}"
-    )
+    reason_log("pnl_update", f"pnl_update | realized={SESSION.realized_pnl:.2f} unrealized={SESSION.unrealized_pnl:.2f} equity={get_equity():.2f}", min_seconds=300)
     
     # Rate-limited equity update for users
     current_equity = get_equity()
@@ -992,7 +1021,6 @@ async def get_sentiment_score(ticker):
     Returns a sentiment score between -1 (very negative) and 1 (very positive).
     """
     # Future integration: Use an AI model or API to fetch sentiment score
-    logging.info(f"Fetching sentiment score for {ticker} (placeholder).")
     return 0  # Neutral sentiment by default
 
 # Weighted Signal Scoring System
@@ -1021,6 +1049,10 @@ MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
 
 # --- Execution-level data hygiene ---
 EXEC_BAD_TICKER_COOLDOWN_MIN = 45   # minutes to ignore tickers with bad/insufficient data
+
+# --- Active ticker rotation constants ---
+AI_REFRESH_SECONDS = 900   # 15 minutes (not 30)
+MIN_ACTIVE_TICKERS = 20    # ensure we keep a broad universe
 
 # === Trade activity tuning (safe) ===
 MVT_ENABLED = True
@@ -1202,25 +1234,14 @@ async def trade_loop_async(allowed_tickers=None):
     get_session(SESSION.USER_ID, SESSION.CURRENT_MODE)
     if allowed_tickers is not None:
         # Override AI-selected tickers
-        SESSION.TICKERS = list(allowed_tickers)
+        SESSION.ACTIVE_TICKERS = list(allowed_tickers)
     
     # Market-aware startup: instant wake-up
     while True:
         state = await wait_until_market_open_or_preopen()
 
         if state == "preopen":
-            logging.info("Pre-open phase: running AI ticker selector early.")
-            selected_tickers = await asyncio.to_thread(
-                get_top_tickers,
-                30,
-                SESSION.USER_ID,
-                SESSION.CURRENT_MODE
-            )
-            if selected_tickers:
-                SESSION.TICKERS = list(selected_tickers)
-                SESSION.ACTIVE_TICKERS = list(selected_tickers)
-                logging.info(f"Pre-open AI tickers prepared: {SESSION.TICKERS}")
-                supabase_log(f"ai_scan_complete | tickers={SESSION.TICKERS}")
+            logging.info("Pre-open phase: waiting for market open.")
             continue
 
         if state == "open":
@@ -1236,23 +1257,33 @@ async def trade_loop_async(allowed_tickers=None):
                 SESSION.first_trade_done = False
             except Exception as e:
                 logging.warning(f"Could not capture market open timestamp: {e}")
+            
+            # On market open, immediately get tickers if not overridden
+            if allowed_tickers is None and not SESSION.ACTIVE_TICKERS:
+                for retry in range(3):
+                    try:
+                        selected_tickers = await asyncio.to_thread(
+                            get_top_tickers,
+                            30,
+                            SESSION.USER_ID,
+                            SESSION.CURRENT_MODE
+                        )
+                        if selected_tickers:
+                            SESSION.ACTIVE_TICKERS = list(selected_tickers)
+                            logging.info(f"Market-open AI tickers loaded: {len(SESSION.ACTIVE_TICKERS)} tickers")
+                            reason_log("ai_scan_complete", f"ai_scan_complete | tickers={len(SESSION.ACTIVE_TICKERS)}", min_seconds=300)
+                            break
+                        else:
+                            logging.warning(f"AI ticker selector returned empty on retry {retry+1}/3")
+                            if retry < 2:
+                                await asyncio.sleep(10)
+                    except Exception as e:
+                        logging.error(f"AI ticker selector error on retry {retry+1}/3: {e}")
+                        if retry < 2:
+                            await asyncio.sleep(10)
             break
     
-    # Ensure we have tickers if not set during pre-open
-    if not SESSION.TICKERS and allowed_tickers is None:
-        selected_tickers = await asyncio.to_thread(
-            get_top_tickers,
-            30,
-            SESSION.USER_ID,
-            SESSION.CURRENT_MODE
-        )
-        if selected_tickers:
-            SESSION.TICKERS = list(selected_tickers)
-            SESSION.ACTIVE_TICKERS = list(selected_tickers)
-            logging.info(f"Market-open AI tickers loaded: {SESSION.TICKERS}")
-            supabase_log(f"ai_scan_complete | tickers={SESSION.TICKERS}")
-
-    logging.info(f"Trading loop active with tickers: {SESSION.TICKERS}")
+    logging.info(f"Trading loop active with {len(SESSION.ACTIVE_TICKERS)} tickers")
     # Daily safety reset for first-trade bias if worker spans multiple days
     try:
         today = ny_now().date()
@@ -1265,232 +1296,159 @@ async def trade_loop_async(allowed_tickers=None):
     last_heartbeat_log = ny_now()
     while True:
         try:
+            # Market state check with throttling (max once per 30 seconds)
+            now = ny_now()
+            if (SESSION.last_clock_check is None or 
+                (now - SESSION.last_clock_check).total_seconds() >= 30):
+                
+                market_state, time_to_close = get_market_state()
+                SESSION.market_state = market_state
+                SESSION.last_clock_check = now
+                
+                # Handle market state transitions
+                if market_state != "OPEN":
+                    if market_state == "CLOSED" and (SESSION.last_market_state_log is None or 
+                        (now - SESSION.last_market_state_log).total_seconds() > 300):
+                        logging.info("Market closed. Bot sleeping.")
+                        SESSION.last_market_state_log = now
+                    await wait_until_market_open_or_preopen()
+                    continue
+                    
+                # Check for closeout window
+                if market_state == "OPEN" and in_closeout_window(time_to_close):
+                    SESSION.market_state = "CLOSING"
+                    try:
+                        clock = await asyncio.to_thread(SESSION.api.get_clock)
+                        SESSION.market_close_guard_until = clock.next_open if hasattr(clock, 'next_open') else now + datetime.timedelta(hours=24)
+                    except Exception:
+                        SESSION.market_close_guard_until = now + datetime.timedelta(hours=24)
+                    
+                    logging.info("Market closing – closing all positions and pausing entries.")
+                    await close_all_positions()
+                    await wait_until_market_open_or_preopen()
+                    continue
+            
+            # Skip all processing if in closing state or guard active
+            if (SESSION.market_state == "CLOSING" or 
+                (SESSION.market_close_guard_until and now < SESSION.market_close_guard_until)):
+                await asyncio.sleep(60)
+                continue
+            
+            # Only proceed if market is open
+            if SESSION.market_state != "OPEN":
+                await asyncio.sleep(30)
+                continue
+                
+            # Clean open-only scan cycle starts here
             user_minute_log("Bot running — scanning market for opportunities")
             user_five_min_log("Bot active — scanning market and evaluating AI signals")
             
-            # Step 3: daily resets & halts
+            # Rate-limited evaluation logging
+            reason_log("eval_loop", "bot_eval | evaluating trade opportunities", min_seconds=120)
+            
+            # 1. Daily resets and halts
             reset_daily_limits_if_new_day()
             if should_halt_trading():
                 logging.warning("Trading halted due to risk limits. Sleeping 5 minutes...")
                 await asyncio.sleep(300)
                 continue
 
-            logging.info("Bot is evaluating trade opportunities...")
-            
-            # Heartbeat transparency log (rate limited to once per 120 seconds)
-            now = ny_now()
-            if (now - last_heartbeat_log).total_seconds() > 120:
-                supabase_log("bot_heartbeat | phase1_safety_active")
-                # ui_log("heartbeat", "Bot is actively scanning for opportunities…")
-                last_heartbeat_log = now
-            # === Intelligent 30-Minute AI Ticker Refresh ===
-            now = ny_now()
-            if allowed_tickers is None and (now - last_ticker_refresh).total_seconds() > 1800:  # 30 minutes
-                logging.info("Running 30-minute AI ticker refresh...")
-                # ui_log("ai_refresh", "Refreshing AI watchlist…")
-
-                # Fetch new AI tickers
-                new_ai_tickers = await asyncio.to_thread(
-                    get_top_tickers,
-                    30,
-                    SESSION.USER_ID,
-                    SESSION.CURRENT_MODE
-                )
-
-                if not new_ai_tickers:
-                    logging.warning("AI Ticker Selector returned no tickers. Keeping existing set.")
-                    # ui_log("ai_refresh_empty", "No stronger opportunities found. Keeping current watchlist.")
-                    last_ticker_refresh = now
-                else:
-                    # Fetch open positions
+            # 2. Throttled P&L update (max once per 60 seconds)
+            if (SESSION.last_pnl_update is None or 
+                (now - SESSION.last_pnl_update).total_seconds() >= 60):
+                await update_pnl_async()
+                SESSION.last_pnl_update = now
+            # 3. AI Ticker selection & active ticker maintenance (open market only)
+            fresh_ai_tickers = []
+            if SESSION.market_state == "OPEN":
+                # Throttled AI ticker refresh (once per 60 seconds max)
+                if (SESSION.last_ai_refresh is None or 
+                    (now - SESSION.last_ai_refresh).total_seconds() >= 60):
                     try:
-                        positions = await asyncio.to_thread(SESSION.api.get_all_positions)
-                    except Exception as e:
-                        logging.error(f"Failed to fetch positions for refresh comparison: {e}")
-                        positions = []
-
-                    open_positions = {}
-                    for p in positions:
-                        try:
-                            open_positions[p.symbol] = float(p.unrealized_pl)
-                        except Exception:
-                            open_positions[p.symbol] = 0.0
-
-                    # --- CONSERVATIVE AI ROTATION LOGIC (Step 1) ---
-                    active = []
-
-                    # Re-score existing open positions
-                    re_scored_current = {}
-                    for p in positions:
-                        sym = p.symbol
-                        df_cur = await fetch_data_async(sym)
-                        if df_cur is None or len(df_cur) < MIN_BARS_REQUIRED:
-                            continue
-                        cur_rsi = float(df_cur['RSI'].iloc[-1])
-                        cur_atr = float(df_cur['ATR_PCT'].iloc[-1])
-                        cur_macd = float(df_cur['MACD'].iloc[-1])
-                        cur_close = float(df_cur['close'].iloc[-1])
-                        cur_bb_u = float(df_cur['BB_upper'].iloc[-1])
-                        cur_bb_l = float(df_cur['BB_lower'].iloc[-1])
-                        cur_sent = await get_sentiment_score(sym)
-                        score_cur = calculate_signal_score(
-                            rsi=cur_rsi, atr=cur_atr, sentiment=cur_sent,
-                            macd=cur_macd, close_price=cur_close,
-                            bb_upper=cur_bb_u, bb_lower=cur_bb_l
+                        fresh_ai_tickers = await asyncio.to_thread(
+                            get_top_tickers,
+                            15,  # Get 15 tickers from AI
+                            SESSION.USER_ID,
+                            SESSION.CURRENT_MODE
                         )
-                        if score_cur is not None:
-                            re_scored_current[sym] = score_cur
-
-                    # Decide which current tickers remain
-                    for sym, pnl in open_positions.items():
-                        score_cur = re_scored_current.get(sym, -1)
-                        if pnl >= 0 and score_cur >= SIGNAL_BUY_THRESHOLD * 0.7:
-                            logging.info(f"Keeping strong existing ticker {sym} | score={score_cur:.3f}")
-                            active.append(sym)
-                        elif pnl >= 0 and sym in new_ai_tickers:
-                            logging.info(f"Keeping current ticker {sym} as AI still lists it.")
-                            active.append(sym)
-                        else:
-                            if pnl < 0:
-                                logging.info(f"Closing weakened ticker {sym} due to underperformance.")
-                                await asyncio.to_thread(close_position, sym)
-
-                    # Fill remaining slots only with significantly stronger new tickers
-                    for candidate in new_ai_tickers:
-                        if candidate not in active:
-                            # Check candidate score
-                            df_c = await fetch_data_async(candidate)
-                            if df_c is None or len(df_c) < MIN_BARS_REQUIRED:
-                                continue
-                            c_rsi = float(df_c['RSI'].iloc[-1])
-                            c_atr = float(df_c['ATR_PCT'].iloc[-1])
-                            c_macd = float(df_c['MACD'].iloc[-1])
-                            c_close = float(df_c['close'].iloc[-1])
-                            c_bb_u = float(df_c['BB_upper'].iloc[-1])
-                            c_bb_l = float(df_c['BB_lower'].iloc[-1])
-                            c_sent = await get_sentiment_score(candidate)
-                            score_c = calculate_signal_score(
-                                rsi=c_rsi, atr=c_atr, sentiment=c_sent,
-                                macd=c_macd, close_price=c_close,
-                                bb_upper=c_bb_u, bb_lower=c_bb_l
-                            )
-                            if score_c is None:
-                                continue
-
-                            # Check if candidate is clearly stronger than weakest current
-                            if len(active) < 15:
-                                active.append(candidate)
-                            else:
-                                weakest_sym = None
-                                weakest_score = float('inf')
-                                for sym in active:
-                                    sc = re_scored_current.get(sym, -1)
-                                    if sc < weakest_score:
-                                        weakest_score = sc
-                                        weakest_sym = sym
-
-                                if score_c > weakest_score * 1.25:  # must be significantly stronger
-                                    active.remove(weakest_sym)
-                                    active.append(candidate)
-
-                    # Final conservative updated set
-                    SESSION.ACTIVE_TICKERS = active
-                    SESSION.TICKERS = active
-                    logging.info(f"Updated ACTIVE_TICKERS (conservative mode): {SESSION.ACTIVE_TICKERS}")
-                    supabase_log(f"ai_scan_complete | tickers={SESSION.TICKERS}")
-
-                    last_ticker_refresh = now
-
-            if not await is_market_open_async():
-                logging.info("Market closed. Waiting until next open...")
-                await wait_until_market_open_or_preopen()
-                continue
-
-            # Check if market is about to close (non-blocking API call)
-            clock = await safe_api_call(SESSION.api.get_clock)
-            if clock and hasattr(clock, "next_close") and hasattr(clock, "timestamp"):
-                # Some Alpaca clock objects use .timestamp, others may expose .next_close differently
-                try:
-                    time_to_close = clock.next_close - clock.timestamp
-                except Exception:
-                    time_to_close = None
-
-                if time_to_close is not None and time_to_close < datetime.timedelta(minutes=15):
-                    logging.info("Market is about to close. Closing all positions.")
-                    await close_all_positions()
-                    logging.info("Waiting until next market open...")
-                    await wait_until_market_open_or_preopen()
-                    continue
-
-            # Track P&L without blocking the event loop
-            await update_pnl_async()
-
-            # Intelligent ticker rotation: close positions no longer in top tickers if profitable
-            try:
-                positions = await asyncio.to_thread(SESSION.api.get_all_positions)
-            except Exception as e:
-                logging.error(f"Failed to fetch positions for rotation logic: {e}")
-                positions = []
-
-            for position in positions:
-                symbol = position.symbol
-                if symbol not in SESSION.TICKERS:
-                    try:
-                        unrealized = float(position.unrealized_plpc)
-                    except Exception:
-                        unrealized = 0.0
-                    if unrealized > 0.01:  # At least 1% profit
-                        logging.info(f"Closing {symbol} as it is no longer in top tickers and has profit.")
-                        await asyncio.to_thread(close_position, symbol)
-
-            hour_start = ny_now()
-
-            if not SESSION.TICKERS and not SESSION.ACTIVE_TICKERS:
-                logging.warning("Both SESSION.TICKERS and SESSION.ACTIVE_TICKERS empty. Waiting 5 minutes...")
-                await asyncio.sleep(300)
-                continue
-
-            tasks = []
-            entries_attempted = 0
-            tickers_to_process = SESSION.ACTIVE_TICKERS or SESSION.TICKERS
-            for ticker in tickers_to_process:
-                if not await is_market_open_async(ticker):
-                    continue
-
-                now = ny_now()
-                if ticker in SESSION.last_trade_time and (now - SESSION.last_trade_time[ticker]).total_seconds() < TRADE_SPACING_SECONDS:
-                    continue  # honor trade spacing
-
-                if ticker in SESSION.recently_traded and (now - SESSION.recently_traded[ticker]).total_seconds() < REENTRY_COOLDOWN:
-                    logging.info(f"Skipping {ticker} due to re-entry cooldown.")
-                    continue
-
-                # Per-ticker cooldown after loss streak
-                cooloff_until = SESSION.per_ticker_cooloff_until.get(ticker)
-                if cooloff_until and ny_now() < cooloff_until:
-                    logging.info(f"{ticker} cooling off until {cooloff_until}.")
-                    continue
-
-                tasks.append(process_ticker(ticker))
-                entries_attempted += 1
-
-            await asyncio.gather(*tasks)
+                        SESSION.last_ai_refresh = now
+                        if fresh_ai_tickers:
+                            reason_log("ai_refresh", f"AI refresh: got {len(fresh_ai_tickers)} fresh tickers", min_seconds=300)
+                    except Exception as e:
+                        logging.warning(f"AI ticker refresh failed: {e}")
             
-            # Scan cycle summary (user transparency)
-            if entries_attempted == 0:
-                supabase_log("scan_complete | no_valid_entries")
-                # ui_log("scan_complete", "Scan complete — no trade opportunities met safety criteria.")
-            elif entries_attempted > 0:
-                supabase_log("scan_complete | entries_rejected=filters")
-                # ui_log("scan_complete", "Scan complete — opportunities reviewed and filtered by risk checks.")
-
-            if SESSION.consecutive_losses >= 3:
-                logging.warning(f"Cooldown triggered due to 3 losses. Waiting {LOSS_COOLDOWN} seconds...")
-                await asyncio.sleep(LOSS_COOLDOWN)
-                SESSION.consecutive_losses = 0
-
-            if (ny_now() - hour_start).total_seconds() < 60:
-                await asyncio.sleep(30)
+            # Maintain active ticker set, spreading attention across tickers
+            try:
+                current_positions = await asyncio.to_thread(SESSION.api.get_all_positions)
+                position_symbols = [pos.symbol for pos in current_positions if hasattr(pos, 'symbol')]
+            except Exception as e:
+                logging.warning(f"Failed to fetch current positions: {e}")
+                current_positions = []
+                position_symbols = []
+            
+            # Combine fresh AI picks with existing positions to prevent early exits
+            all_candidate_tickers = list(set(fresh_ai_tickers + position_symbols + SESSION.ACTIVE_TICKERS))
+            
+            # Prevent getting stuck on 1-2 tickers - rotate attention
+            if len(all_candidate_tickers) > 4:
+                # Spread attention across tickers every evaluation
+                if not hasattr(SESSION, 'rotation_index'):
+                    SESSION.rotation_index = 0
+                
+                # Select subset for this round (spread attention)
+                batch_size = min(8, len(all_candidate_tickers))
+                start_idx = SESSION.rotation_index % len(all_candidate_tickers)
+                
+                tickers_to_evaluate = []
+                for i in range(batch_size):
+                    ticker_idx = (start_idx + i) % len(all_candidate_tickers)
+                    tickers_to_evaluate.append(all_candidate_tickers[ticker_idx])
+                
+                SESSION.rotation_index = (SESSION.rotation_index + batch_size) % len(all_candidate_tickers)
+                
+                reason_log("ticker_rotation", f"Rotating attention: evaluating {len(tickers_to_evaluate)} of {len(all_candidate_tickers)} candidate tickers", min_seconds=180)
+            else:
+                tickers_to_evaluate = all_candidate_tickers
+            
+            # 4. Concurrent ticker evaluation with semaphore (limit 10 simultaneous operations)
+            if tickers_to_evaluate:
+                semaphore = asyncio.Semaphore(10)
+                
+                async def process_ticker_with_limit(ticker):
+                    async with semaphore:
+                        try:
+                            # Stale evaluation guard (spread attention, avoid spam)
+                            if ticker in SESSION.last_ticker_eval:
+                                last_eval = SESSION.last_ticker_eval[ticker]
+                                if (now - last_eval).total_seconds() < 60:
+                                    return None
+                            
+                            SESSION.last_ticker_eval[ticker] = now
+                            return await process_ticker(ticker)
+                        except Exception as e:
+                            logging.warning(f"Error processing ticker {ticker}: {e}")
+                            return None
+                
+                # Process all tickers concurrently within semaphore limit
+                tasks = [process_ticker_with_limit(ticker) for ticker in tickers_to_evaluate]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Log successful evaluations (throttled)
+                successful_evals = len([r for r in results if r is not None and not isinstance(r, Exception)])
+                if successful_evals > 0:
+                    reason_log("eval_success", f"Successfully evaluated {successful_evals}/{len(tickers_to_evaluate)} tickers", min_seconds=120)
+            
+            # 5. Update active ticker set based on current positions
+            SESSION.ACTIVE_TICKERS = list(set(
+                position_symbols +
+                list(SESSION.ACTIVE_TICKERS)[-20:]  # Keep last 20 active tickers for momentum
+            ))
+            
+            # Clean evaluation cycle complete
+            reason_log("eval_complete", f"Evaluation cycle complete | Active positions: {len(current_positions)} | Market: {SESSION.market_state}", min_seconds=120)
+            
+            # Clean cycle pause
+            await asyncio.sleep(15)
 
         except RateLimitError as e:
             logging.error(e)

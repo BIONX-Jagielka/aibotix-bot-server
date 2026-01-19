@@ -79,6 +79,12 @@ RSI_PERIOD = 14
 MAX_TRADABLE_SCREEN = 250  # how many symbols to volume-screen
 MAX_INDICATOR_TASKS = 120   # how many symbols to fetch intraday indicators for
 
+# Historical context constants
+HISTORICAL_LOOKBACK_DAYS = 120
+MIN_HISTORY_BARS = 60
+HIST_VOL_PENALTY_THRESHOLD = 0.12
+HIST_RECOVERY_LOOKBACK = 20
+
 # --- Bad data memory (prevents re-scanning symbols with no bars) ---
 BAD_DATA_COOLDOWN_SECONDS = 6 * 60 * 60  # 6 hours
 _BAD_DATA_REGISTRY = {}  # symbol -> last_failed_timestamp
@@ -144,6 +150,67 @@ async def fetch_indicators(symbol: str, mode: str):
         logging.warning(f"Fetch failed for {symbol}: {e}")
         _mark_bad_data(symbol)
         # Do not raise here – return None so other symbols can still be processed
+        return None
+
+def compute_historical_context(symbol: str, mode: str) -> dict | None:
+    """
+    Compute historical context for a symbol using daily bars.
+    Returns dict with hist_volatility, max_drawdown, avg_recovery_days or None if insufficient data.
+    """
+    try:
+        data_client, trading_client = init_clients(mode)
+        bars_req = StockBarsRequest(
+            symbol_or_symbols=symbol, 
+            timeframe=TimeFrame.Day, 
+            limit=HISTORICAL_LOOKBACK_DAYS
+        )
+        bars = data_client.get_stock_bars(bars_req).df
+        
+        if bars.empty or len(bars) < MIN_HISTORY_BARS:
+            return None
+            
+        # Calculate daily returns
+        daily_returns = bars['close'].pct_change().dropna()
+        if len(daily_returns) < MIN_HISTORY_BARS:
+            return None
+            
+        # Historical volatility (std of daily returns)
+        hist_volatility = daily_returns.std()
+        
+        # Max drawdown calculation
+        cumulative = (1 + daily_returns).cumprod()
+        running_max = cumulative.expanding().max()
+        drawdown = (cumulative - running_max) / running_max
+        max_drawdown = abs(drawdown.min())
+        
+        # Average recovery days after >=3% pullbacks
+        recovery_days = []
+        prices = bars['close'].values
+        
+        for i in range(1, len(prices)):
+            # Look for 3%+ pullback
+            pullback_start = prices[i-1]
+            current_price = prices[i]
+            
+            if (pullback_start - current_price) / pullback_start >= 0.03:
+                # Found pullback, look for recovery
+                recovery_target = pullback_start * 0.99  # 99% recovery
+                
+                for j in range(i+1, min(i+HIST_RECOVERY_LOOKBACK+1, len(prices))):
+                    if prices[j] >= recovery_target:
+                        recovery_days.append(j - i)
+                        break
+        
+        avg_recovery_days = sum(recovery_days) / len(recovery_days) if recovery_days else HIST_RECOVERY_LOOKBACK + 1
+        
+        return {
+            "hist_volatility": hist_volatility,
+            "max_drawdown": max_drawdown,
+            "avg_recovery_days": avg_recovery_days
+        }
+        
+    except Exception as e:
+        logging.warning(f"Historical context failed for {symbol}: {e}")
         return None
 
 async def stage_a_screen_and_collect(mode: str, limit: int = 5):
@@ -233,6 +300,40 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
         if df is not None and len(df) > 10:
             latest = df.iloc[-1]
             logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
+            
+            # Calculate initial score
+            score = unified_ai_score(
+                rsi=latest['rsi'],
+                atr=latest['atr'],
+                ema_crossover=latest['ema_crossover'],
+                volume_ratio=latest['volume_ratio'],
+                slope=latest['slope'],
+                gap=latest['gap'],
+            ) or 0.0
+            
+            # Apply historical context modifier (Step 3)
+            hist_context = compute_historical_context(symbol, mode)
+            if hist_context is not None:
+                original_score = score
+                
+                # Apply volatility penalty
+                if hist_context["hist_volatility"] > HIST_VOL_PENALTY_THRESHOLD:
+                    score *= 0.85
+                
+                # Apply recovery bonus
+                if hist_context["avg_recovery_days"] <= HIST_RECOVERY_LOOKBACK:
+                    score *= 1.10
+                
+                # Clamp to minimum
+                score = max(0.01, score)
+                
+                # Rate-limited logging when context is applied (Step 4)
+                if score != original_score:
+                    logging.info(
+                        f"HistContext | {symbol} | vol={hist_context['hist_volatility']:.3f} "
+                        f"dd={hist_context['max_drawdown']:.2f} recov={hist_context['avg_recovery_days']:.0f}d"
+                    )
+            
             indicator_results.append({
                 "symbol": symbol,
                 "rsi": latest['rsi'],
@@ -245,14 +346,10 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                 "volume_ratio": latest['volume_ratio'],
                 "slope": latest['slope'],
                 "gap": latest['gap'],
-                "score": unified_ai_score(
-                    rsi=latest['rsi'],
-                    atr=latest['atr'],
-                    ema_crossover=latest['ema_crossover'],
-                    volume_ratio=latest['volume_ratio'],
-                    slope=latest['slope'],
-                    gap=latest['gap'],
-                ) or 0.0
+                "score": score,
+                "hist_volatility": hist_context.get("hist_volatility") if hist_context else None,
+                "avg_recovery_days": hist_context.get("avg_recovery_days") if hist_context else None,
+                "max_drawdown": hist_context.get("max_drawdown") if hist_context else None,
             })
 
     logging.info(f"{len(indicator_results)} tickers gathered with indicators after screening.")
@@ -697,6 +794,9 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
             "atrp": float(r.get("atr_pct") or 0.0),
             "macd": float(r.get("macd") or 0.0),
             "sentiment": float(r.get("sentiment") or 0.0),
+            "hist_volatility": r.get("hist_volatility"),
+            "avg_recovery_days": r.get("avg_recovery_days"),
+            "max_drawdown": r.get("max_drawdown"),
         })
 
     if not rows:

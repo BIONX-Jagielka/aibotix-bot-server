@@ -187,6 +187,128 @@ def user_minute_log(message: str):
     _last_user_minute_log[key] = now
     supabase_log(f"ui | {message}")
 
+# === Phase 2.2: Historical Hint Consumption (no calculations in bot) ===
+HIST_HINT_CACHE_TTL_SEC = 300  # 5 min cache to reduce Supabase hits
+_hist_hint_cache: dict[str, tuple[datetime.datetime, dict]] = {}  # key=user:mode:ticker -> (ts, hint)
+
+def _hist_hint_cache_key(ticker: str) -> str:
+    uid = getattr(SESSION, "USER_ID", None)
+    mode = getattr(SESSION, "CURRENT_MODE", None)
+    return f"{uid}:{mode}:{ticker}"
+
+def get_historical_hint(ticker: str) -> dict | None:
+    """
+    Fetch precomputed historical context produced by the AI ticker selector.
+    This bot MUST NOT compute history; it only consumes hints if available.
+    Returns None if not available or any error occurs (safe default).
+    Expected fields (optional): hist_volatility, avg_recovery_days, max_drawdown
+    """
+    if supabase is None:
+        return None
+    uid = getattr(SESSION, "USER_ID", None)
+    mode = getattr(SESSION, "CURRENT_MODE", None)
+    if uid is None or mode is None:
+        return None
+
+    # Cache
+    try:
+        now = datetime.datetime.now(ny_tz)
+    except Exception:
+        now = datetime.datetime.utcnow()
+
+    ck = _hist_hint_cache_key(ticker)
+    cached = _hist_hint_cache.get(ck)
+    if cached:
+        ts, hint = cached
+        if (now - ts).total_seconds() < HIST_HINT_CACHE_TTL_SEC:
+            return hint
+
+    # IMPORTANT:
+    # We query ai_tickers first because it already exists in your stack.
+    # This will NOT break if columns do not exist — we handle exceptions and return None.
+    try:
+        # Try to pull additional hint columns if your AI selector stores them.
+        # If your table doesn't have these columns yet, Supabase may error -> we catch and return None.
+        res = (
+            supabase.table("ai_tickers")
+            .select("ticker,hist_volatility,avg_recovery_days,max_drawdown,updated_at")
+            .eq("user_id", uid)
+            .eq("mode", mode)
+            .eq("ticker", ticker)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return None
+
+        row = rows[0] or {}
+        hint = {
+            "hist_volatility": row.get("hist_volatility"),
+            "avg_recovery_days": row.get("avg_recovery_days"),
+            "max_drawdown": row.get("max_drawdown"),
+        }
+
+        # Drop empties (so we can treat "no hint" cleanly)
+        hint = {k: v for k, v in hint.items() if v is not None}
+        if not hint:
+            return None
+
+        _hist_hint_cache[ck] = (now, hint)
+        return hint
+
+    except Exception:
+        # Safe fallback: no hint
+        return None
+
+def apply_historical_hint_multiplier(ticker: str, qty: float) -> tuple[float, float, dict | None]:
+    """
+    Applies soft sizing modifiers based on historical hint.
+    Returns: (new_qty, multiplier, hint)
+    Never blocks entries. Never changes tier. Never changes logic beyond qty scaling.
+    """
+    if qty is None:
+        return qty, 1.0, None
+    try:
+        qty_f = float(qty)
+    except Exception:
+        return qty, 1.0, None
+
+    hint = get_historical_hint(ticker)
+    if not hint:
+        return qty_f, 1.0, None
+
+    mult = 1.0
+
+    # Soft volatility penalty if selector flagged high vol (expects numeric float volatility OR string tag)
+    hv = hint.get("hist_volatility")
+    try:
+        if isinstance(hv, (int, float)) and float(hv) > 0.12:
+            mult *= 0.85
+    except Exception:
+        pass
+    if isinstance(hv, str) and hv.upper() in ("HIGH", "VERY_HIGH"):
+        mult *= 0.85
+
+    # Soft recovery bonus/penalty (expects numeric avg recovery days OR string tag)
+    rec = hint.get("avg_recovery_days")
+    try:
+        if isinstance(rec, (int, float)) and float(rec) <= 20:
+            mult *= 1.10
+        elif isinstance(rec, (int, float)) and float(rec) >= 35:
+            mult *= 0.85
+    except Exception:
+        pass
+    if isinstance(rec, str) and rec.upper() in ("FAST",):
+        mult *= 1.10
+    if isinstance(rec, str) and rec.upper() in ("SLOW", "VERY_SLOW"):
+        mult *= 0.85
+
+    # Clamp safety: never negative, never explode
+    mult = max(0.50, min(mult, 1.15))  # soft bounds
+    new_qty = max(qty_f * mult, 0.0)
+    return new_qty, mult, hint
+
 def get_market_state() -> tuple[str, datetime.timedelta | None]:
     """Get current market state using SESSION.api.get_clock()"""
     if SESSION.api is None:
@@ -229,7 +351,6 @@ API_SECRET = None
 BASE_URL = 'https://paper-api.alpaca.markets'  # use live URL for real trading
 # TICKERS will be dynamically set using AI ticker selector
 # TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
-TICKERS = []
 RSI_PERIOD = 14
 
 # Minimum bars required for safe indicator calculation
@@ -242,8 +363,8 @@ MAX_CONCURRENT_POSITIONS = 30
 # --- Position sizing safety caps (prevents oversized notional trades) ---
 # Cap any single trade notional to a small slice of equity AND an absolute ceiling.
 # This is separate from MAX_TICKER_EXPOSURE (portfolio concentration cap).
-MAX_TRADE_NOTIONAL_PCT = 0.05      # 5% of usable equity per entry
-MAX_TRADE_NOTIONAL_ABS = 2500.0    # hard cap in account currency (USD). Set None to disable.
+MAX_TRADE_NOTIONAL_PCT = 0.08      # allow up to 8% of equity per entry
+MAX_TRADE_NOTIONAL_ABS = 7500.0    # allow larger trades on high equity accounts
 LOSS_COOLDOWN = 300  # 5 minutes
 STOP_LOSS_ATR_MULT = 1.5
 TAKE_PROFIT_ATR_MULT = 2.0
@@ -883,7 +1004,8 @@ def calculate_position_size(symbol, risk_per_trade):
     # Capital scaling for multiple concurrent positions
     MAX_CAPITAL_USAGE = 0.95  # keep safety reserve
     available_capital = equity * MAX_CAPITAL_USAGE
-    per_trade_capital = available_capital / MAX_CONCURRENT_POSITIONS
+    # Allow stronger trades to use more capital without increasing risk
+    per_trade_capital = available_capital / max(MAX_CONCURRENT_POSITIONS * 0.6, 1)
     
     max_risk = max(usable_equity * risk_per_trade, 0.01)  # ensure a tiny non-zero risk budget
 
@@ -940,12 +1062,12 @@ def calculate_position_size(symbol, risk_per_trade):
 def scale_qty_by_score(qty, score):
     if score is None:
         return 0.0
-    if score < 0.30:
-        return qty * 0.25
-    elif score < 0.45:
-        return qty * 0.50
-    elif score < 0.65:
-        return qty * 0.75
+    if score < 0.25:
+        return qty * 0.55
+    elif score < 0.40:
+        return qty * 0.65
+    elif score < 0.60:
+        return qty * 0.85
     else:
         return qty
 
@@ -1030,7 +1152,7 @@ INDICATOR_WEIGHTS = {
     'Sentiment': 0.2
 }
 # --- Signal thresholds & trade guards ---
-SIGNAL_BUY_THRESHOLD = 0.20   # how strong the combined signal must be to enter
+SIGNAL_BUY_THRESHOLD = 0.17   # how strong the combined signal must be to enter
 SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
 MICRO_PROFIT_TAKE = 0.001   # 0.10% fast profit snap exit
 
@@ -1042,7 +1164,7 @@ TIER2_SIZE_MULT = 0.50        # half-size entries
 # Volatility guard (ignore ultra-quiet or too-wild regimes)
 # NOTE: slightly widened to allow more tradable setups while still avoiding dead/chaotic regimes
 MIN_ATR_PCT = 0.002   # 0.2% of price
-MAX_ATR_PCT = 0.09    # 9% of price
+MAX_ATR_PCT = 0.10    # 10% of price
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
@@ -1056,7 +1178,7 @@ MIN_ACTIVE_TICKERS = 20    # ensure we keep a broad universe
 
 # === Trade activity tuning (safe) ===
 MVT_ENABLED = True
-MVT_MIN_SCORE = 0.18                  # allow "good enough" setups when momentum/trend confirm
+MVT_MIN_SCORE = 0.16                  # allow "good enough" setups when momentum/trend confirm
 MVT_RSI_MIN = 42
 MVT_RSI_MAX = 62
 MVT_MIN_ATR_PCT = 0.0020              # 0.20% ATR% minimum for MVT
@@ -1686,7 +1808,7 @@ async def process_ticker(ticker):
             return
 
         # 2. ATR volatility filter (avoid weak or explosive regimes)
-        if pd.isna(atr_pct) or atr_pct < 0.0025 or atr_pct > 0.07:
+        if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=ATR_RANGE atr_pct={atr_pct:.4f}")
             return
 
@@ -1792,7 +1914,9 @@ async def process_ticker(ticker):
         qty = calculate_position_size(ticker, RISK_PER_TRADE)
 
         # Tier-based size adjustment
-        if tier == "TIER2":
+        if tier == "TIER1":
+            qty = qty * 1.35   # confidence boost for strong setups
+        elif tier == "TIER2":
             qty = qty * TIER2_SIZE_MULT
         elif tier == "MVT":
             qty = qty * 0.40
@@ -1815,6 +1939,21 @@ async def process_ticker(ticker):
             # SQUEEZE entries are allowed (unless too quiet), but size is reduced to limit risk.
             qty = qty * 0.5
             logging.debug(f"[REGIME SIZING] {ticker} | SQUEEZE regime - reduced position size by 50%")
+        
+        # === Phase 2.2: Apply historical hint sizing (SOFT; never blocks) ===
+        qty_before_hint = qty
+        qty, hist_mult, hist_hint = apply_historical_hint_multiplier(ticker, qty)
+
+        if hist_hint and hist_mult != 1.0:
+            reason_log(
+                f"hist_hint:{ticker}",
+                f"HistHint | {ticker} | mult={hist_mult:.2f} | hint={hist_hint}",
+                min_seconds=300
+            )
+        
+        # === Step 3: First trade confidence boost (controlled) ===
+        if tier in ("TIER1", "TIER2") and not SESSION.first_trade_done:
+            qty *= 1.5
         
         # Phase 1 Safety: Buying power guard
         required_dollars = qty * close_price

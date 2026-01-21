@@ -362,7 +362,7 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             macd_norm = float(latest.get('macd', 0)) if latest.get('macd') is not None else 0.0
             sentiment_norm = float(latest.get('sentiment', 0)) if latest.get('sentiment') is not None else 0.0
             hist_volatility_norm = float(hist_context.get("hist_volatility")) if hist_context and hist_context.get("hist_volatility") is not None else 0.0
-            avg_recovery_days_norm = float(hist_context.get("avg_recovery_days")) if hist_context and hist_context.get("avg_recovery_days") is not None else float(HIST_RECOVERY_LOOKBACK + 1)
+            avg_recovery_days_norm = int(hist_context.get("avg_recovery_days")) if hist_context and hist_context.get("avg_recovery_days") is not None else int(HIST_RECOVERY_LOOKBACK + 1)
             max_drawdown_norm = float(hist_context.get("max_drawdown")) if hist_context and hist_context.get("max_drawdown") is not None else 0.0
             
             indicator_results.append({
@@ -825,7 +825,7 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
         macd_norm = float(r.get("macd")) if r.get("macd") is not None else 0.0
         sentiment_norm = float(r.get("sentiment")) if r.get("sentiment") is not None else 0.0
         hist_volatility_norm = float(r.get("hist_volatility")) if r.get("hist_volatility") is not None else 0.0
-        avg_recovery_days_norm = float(r.get("avg_recovery_days")) if r.get("avg_recovery_days") is not None else float(HIST_RECOVERY_LOOKBACK + 1)
+        avg_recovery_days_norm = int(r.get("avg_recovery_days")) if r.get("avg_recovery_days") is not None else int(HIST_RECOVERY_LOOKBACK + 1)
         max_drawdown_norm = float(r.get("max_drawdown")) if r.get("max_drawdown") is not None else 0.0
         
         rows.append({

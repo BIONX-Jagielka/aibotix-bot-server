@@ -53,6 +53,11 @@ class BotSession:
         
         # Ticker evaluation throttling
         self.last_ticker_eval = {}  # ticker -> datetime
+        
+        # Graduated risk management state
+        self.risk_state = "NORMAL"  # NORMAL | DEGRADED | HALT
+        self.last_risk_state_log = None
+        self.per_ticker_loss_cooldown = {}  # ticker -> datetime until which ticker is cooled
 
 # Multi-user session registry: one BotSession per (user_id, mode)
 SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
@@ -99,7 +104,14 @@ from dotenv import load_dotenv
 import logging
 import asyncio
 import random
+from enum import Enum
 from bot.ai_ticker_selector_aibotix import get_top_tickers
+
+# Risk state enumeration for graduated risk management
+class RiskState(Enum):
+    NORMAL = "normal"      # Normal trading conditions
+    DEGRADED = "degraded"  # Reduced position sizes, stricter criteria
+    HALT = "halt"          # No new positions, only exits
 
 # Alpaca data API imports for historical and latest trade data (v3)
 from alpaca.data.historical import StockHistoricalDataClient
@@ -244,18 +256,39 @@ def get_historical_hint(ticker: str) -> dict | None:
 
         row = rows[0] or {}
         hint = {
-            "hist_volatility": row.get("hist_volatility"),
-            "avg_recovery_days": row.get("avg_recovery_days"),
-            "max_drawdown": row.get("max_drawdown"),
+            "hist_volatility": row.get("hist_volatility") or 0.0,
+            "avg_recovery_days": row.get("avg_recovery_days") or 20.0,
+            "max_drawdown": row.get("max_drawdown") or 0.0,
         }
 
-        # Drop empties (so we can treat "no hint" cleanly)
-        hint = {k: v for k, v in hint.items() if v is not None}
-        if not hint:
+        # Remove any remaining None values and ensure numeric types
+        safe_hint = {}
+        for k, v in hint.items():
+            if v is not None:
+                try:
+                    safe_hint[k] = float(v)
+                except (ValueError, TypeError):
+                    # Use safe defaults for invalid data
+                    if k == "hist_volatility":
+                        safe_hint[k] = 0.0
+                    elif k == "avg_recovery_days":
+                        safe_hint[k] = 20.0
+                    else:
+                        safe_hint[k] = 0.0
+            else:
+                # Provide safe defaults for NULL values
+                if k == "hist_volatility":
+                    safe_hint[k] = 0.0
+                elif k == "avg_recovery_days":
+                    safe_hint[k] = 20.0
+                else:
+                    safe_hint[k] = 0.0
+        
+        if not safe_hint:
             return None
 
-        _hist_hint_cache[ck] = (now, hint)
-        return hint
+        _hist_hint_cache[ck] = (now, safe_hint)
+        return safe_hint
 
     except Exception:
         # Safe fallback: no hint
@@ -378,10 +411,12 @@ BRACKET_ORDERS_ENABLED = True   # when True, BUY orders place server-side OCO TP
 RESERVE_FUND_PCT = 0.05         # keep 5% of equity unallocated as a safety buffer
 
 # === Step 3: Enhanced Risk Controls ===
-DAILY_MAX_LOSS_PCT = 0.03        # stop trading for the day if equity drawdown exceeds 3%
-DAILY_MAX_LOSS_DOLLARS = None    # optional hard dollar cap; set to a number (e.g., 200) to enforce alongside %
-MAX_CONSECUTIVE_LOSSES_HALT = 5  # if this many losing exits occur in a day, halt trading until next session
-PER_TICKER_MAX_LOSS_STREAK = 3   # per-ticker loss streak before cooling off that ticker
+DAILY_MAX_LOSS_PCT = 0.0075       # 0.75% max loss triggers HALT state
+DAILY_DEGRADED_LOSS_PCT = 0.0025  # 0.25% loss triggers DEGRADED state
+DAILY_MAX_LOSS_DOLLARS = None      # optional hard dollar cap; set to a number (e.g., 200) to enforce alongside %
+MAX_CONSECUTIVE_LOSSES_HALT = 5    # if this many losing exits occur in a day, halt trading until next session
+PER_TICKER_MAX_LOSS_STREAK = 3     # per-ticker loss streak before cooling off that ticker
+PER_TICKER_LOSS_COOLDOWN_MIN = 20  # minutes to cool off a ticker after individual loss (not streak)
 PER_TICKER_COOLDOWN_MIN = 60     # minutes to cool off a ticker after it hits its loss streak
 
 # Track recent per-ticker attempts (ticker, minute) -> count
@@ -530,27 +565,70 @@ def _calc_daily_loss_limit():
     return max(DAILY_MAX_LOSS_DOLLARS, pct_cap or 0.0)
 
 
+def get_risk_state():
+    """Determine current risk state based on daily PnL and equity."""
+    if SESSION.start_of_day_equity is None:
+        return "NORMAL"
+    
+    current_equity = get_equity()
+    daily_loss_pct = abs(SESSION.daily_realized_pnl) / SESSION.start_of_day_equity if SESSION.start_of_day_equity > 0 else 0
+    
+    # Check for HALT state (severe loss)
+    halt_limit_pct = DAILY_MAX_LOSS_PCT if DAILY_MAX_LOSS_PCT else 0.0075
+    if daily_loss_pct >= halt_limit_pct:
+        return "HALT"
+    
+    # Check for DEGRADED state (moderate loss)
+    degraded_limit_pct = DAILY_DEGRADED_LOSS_PCT if DAILY_DEGRADED_LOSS_PCT else 0.0025
+    if daily_loss_pct >= degraded_limit_pct:
+        return "DEGRADED"
+    
+    return "NORMAL"
+
+def update_risk_state():
+    """Update risk state and log transitions."""
+    new_state = get_risk_state()
+    old_state = SESSION.risk_state
+    
+    if new_state != old_state:
+        now = datetime.datetime.now(ny_tz)
+        if SESSION.last_risk_state_log is None or (now - SESSION.last_risk_state_log).total_seconds() >= 300:
+            logging.warning(f"Risk state transition: {old_state} → {new_state} (Daily PnL: ${SESSION.daily_realized_pnl:.2f})")
+            supabase_log(f"risk_state_change | {old_state}_to_{new_state} | daily_pnl={SESSION.daily_realized_pnl:.2f}")
+            SESSION.last_risk_state_log = now
+        
+        SESSION.risk_state = new_state
+        
+        # Recovery logging
+        if old_state == "DEGRADED" and new_state == "NORMAL":
+            logging.info("Risk state recovered to NORMAL - full trading resumed")
+            ui_event("Risk managed - full trading capability restored")
+
 def should_halt_trading():
-    """True if trading should be halted due to daily loss cap, manual cooldown, or market close proximity."""
+    """True if trading should be completely halted (only in HALT state or manual halt)."""
     now = datetime.datetime.now(ny_tz)
+    
+    # Manual halt override
     if SESSION.trading_halted_until and now < SESSION.trading_halted_until:
         return True
-    # Daily drawdown check
-    loss_limit = _calc_daily_loss_limit()
-    if loss_limit is not None and SESSION.daily_realized_pnl <= -abs(loss_limit):
-        # Halt until next market open
+    
+    # Update risk state
+    update_risk_state()
+    
+    # Only halt in HALT state, not DEGRADED
+    if SESSION.risk_state == "HALT":
         if SESSION.api is None:
             logging.error("Trading client not initialised. Cannot check clock for halt logic.")
             SESSION.trading_halted_until = now + datetime.timedelta(hours=24)
             return True
         try:
             clock = SESSION.api.get_clock()
-            # Halt until next open time if available
             SESSION.trading_halted_until = clock.next_open if hasattr(clock, "next_open") else now + datetime.timedelta(hours=24)
         except Exception:
             SESSION.trading_halted_until = now + datetime.timedelta(hours=24)
-        logging.warning(f"Daily loss limit reached (PnL: {SESSION.daily_realized_pnl:.2f}). Trading halted until {SESSION.trading_halted_until}.")
+        logging.warning(f"HALT state triggered - trading halted until {SESSION.trading_halted_until}")
         return True
+    
     # Global halt on many consecutive losses
     if MAX_CONSECUTIVE_LOSSES_HALT and SESSION.consecutive_losses >= MAX_CONSECUTIVE_LOSSES_HALT:
         if SESSION.api is None:
@@ -564,6 +642,22 @@ def should_halt_trading():
             SESSION.trading_halted_until = datetime.datetime.now(ny_tz) + datetime.timedelta(hours=24)
         logging.warning(f"Exceeded max consecutive losses ({SESSION.consecutive_losses}). Trading halted until {SESSION.trading_halted_until}.")
         return True
+    
+    return False
+
+def is_ticker_in_cooldown(ticker: str) -> bool:
+    """Check if ticker is in loss cooldown period."""
+    cooldown_until = SESSION.per_ticker_loss_cooldown.get(ticker)
+    if cooldown_until is None:
+        return False
+    
+    now = datetime.datetime.now(ny_tz)
+    if now < cooldown_until:
+        return True
+    
+    # Cooldown expired, remove it
+    del SESSION.per_ticker_loss_cooldown[ticker]
+    logging.info(f"Ticker {ticker} cooldown expired - trading resumed")
     return False
 
 
@@ -572,9 +666,16 @@ def _register_trade_outcome(ticker: str, pnl: float):
     # Global loss streak
     if pnl < 0:
         SESSION.consecutive_losses += 1
+        
+        # Apply per-ticker loss cooldown
+        cooldown_until = datetime.datetime.now(ny_tz) + datetime.timedelta(minutes=PER_TICKER_LOSS_COOLDOWN_MIN)
+        SESSION.per_ticker_loss_cooldown[ticker] = cooldown_until
+        logging.info(f"Ticker {ticker} entered {PER_TICKER_LOSS_COOLDOWN_MIN}min cooldown after loss (${pnl:.2f})")
+        
     else:
         SESSION.consecutive_losses = 0
-    # Per ticker loss streak & cooldown
+    
+    # Per ticker loss streak & cooldown (for streak-based cooldowns)
     if ticker not in SESSION.per_ticker_loss_streak:
         SESSION.per_ticker_loss_streak[ticker] = 0
     if pnl < 0:
@@ -584,6 +685,7 @@ def _register_trade_outcome(ticker: str, pnl: float):
             logging.warning(f"Cooling off {ticker} for {PER_TICKER_COOLDOWN_MIN} minutes due to loss streak.")
     else:
         SESSION.per_ticker_loss_streak[ticker] = 0
+    
     # Global halt on many consecutive losses
     if MAX_CONSECUTIVE_LOSSES_HALT and SESSION.consecutive_losses >= MAX_CONSECUTIVE_LOSSES_HALT:
         if SESSION.api is None:
@@ -1468,12 +1570,18 @@ async def trade_loop_async(allowed_tickers=None):
             # Rate-limited evaluation logging
             reason_log("eval_loop", "bot_eval | evaluating trade opportunities", min_seconds=120)
             
-            # 1. Daily resets and halts
+            # 1. Daily resets and risk state management
             reset_daily_limits_if_new_day()
-            if should_halt_trading():
-                logging.warning("Trading halted due to risk limits. Sleeping 5 minutes...")
+            risk_state = get_risk_state()
+            
+            # Only sleep in HALT state, not DEGRADED
+            if risk_state == RiskState.HALT:
+                logging.warning("Trading HALTED due to risk limits. Sleeping 5 minutes...")
                 await asyncio.sleep(300)
                 continue
+            elif risk_state == RiskState.DEGRADED:
+                logging.warning("Trading in DEGRADED state - reduced position sizes and stricter entry criteria")
+                # Continue trading with degraded conditions
 
             # 2. Throttled P&L update (max once per 60 seconds)
             if (SESSION.last_pnl_update is None or 
@@ -1591,6 +1699,10 @@ async def process_ticker(ticker):
         # Execution-level bad ticker cooldown
         bad_until = SESSION.bad_ticker_until.get(ticker)
         if bad_until and ny_now() < bad_until:
+            return
+        
+        # Per-ticker loss cooldown check
+        if is_ticker_in_cooldown(ticker):
             return
         
         # Respect global halts
@@ -1838,6 +1950,12 @@ async def process_ticker(ticker):
 
         # 6. Score threshold (conditional) + Minimum Viable Trade (MVT) + Market Regime Awareness
         base_threshold = SIGNAL_BUY_THRESHOLD * 1.05  # conservative baseline
+        
+        # Apply risk state threshold adjustment
+        if SESSION.risk_state == "DEGRADED":
+            base_threshold = base_threshold * 1.15  # Slightly higher threshold in degraded state
+            logging.debug(f"[RISK THRESHOLD] {ticker} | DEGRADED state - increased threshold to {base_threshold:.3f}")
+        
         threshold = base_threshold
         
         # Market regime-aware threshold adjustments (inspired by "Mastering the Trade")
@@ -1912,6 +2030,14 @@ async def process_ticker(ticker):
             return
 
         qty = calculate_position_size(ticker, RISK_PER_TRADE)
+
+        # Apply risk state scaling
+        if SESSION.risk_state == "DEGRADED":
+            qty = qty * 0.5  # Reduce position size in degraded state
+            logging.debug(f"[RISK SCALING] {ticker} | DEGRADED state - reduced position size by 50%")
+        elif SESSION.risk_state == "HALT":
+            # Should not reach here as should_halt_trading() should prevent this
+            return
 
         # Tier-based size adjustment
         if tier == "TIER1":

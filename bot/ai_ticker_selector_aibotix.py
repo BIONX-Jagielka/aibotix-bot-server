@@ -334,25 +334,59 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                         f"dd={hist_context['max_drawdown']:.2f} recov={hist_context['avg_recovery_days']:.0f}d"
                     )
             
+            # STEP 2: Early session score dampening (not blocking)
+            is_early_session = len(df) < 60
+            if not is_early_session and df.index[-1] is not None:
+                # Check if most recent bar is within first 45 minutes of session
+                from datetime import time, timedelta
+                try:
+                    last_bar_time = df.index[-1].time() if hasattr(df.index[-1], 'time') else None
+                    if last_bar_time:
+                        market_open = time(9, 30)  # 9:30 AM ET
+                        early_cutoff = (datetime.combine(datetime.today(), market_open) + timedelta(minutes=45)).time()
+                        is_early_session = last_bar_time <= early_cutoff
+                except:
+                    pass
+            
+            if is_early_session:
+                score *= 0.85
+            
+            # STEP 3: Score compression (anti-spike)
+            score = np.tanh(score)
+            score = max(0.01, score)
+            
+            # STEP 1: Normalize ALL AI output fields (never None)
+            rsi_norm = float(latest['rsi']) if latest['rsi'] is not None and not pd.isna(latest['rsi']) else 50.0
+            atr_norm = float(latest['atr']) if latest['atr'] is not None and not pd.isna(latest['atr']) else 1.0
+            atr_pct_norm = float(atr_norm * 100) if atr_norm is not None else 100.0
+            macd_norm = float(latest.get('macd', 0)) if latest.get('macd') is not None else 0.0
+            sentiment_norm = float(latest.get('sentiment', 0)) if latest.get('sentiment') is not None else 0.0
+            hist_volatility_norm = float(hist_context.get("hist_volatility")) if hist_context and hist_context.get("hist_volatility") is not None else 0.0
+            avg_recovery_days_norm = float(hist_context.get("avg_recovery_days")) if hist_context and hist_context.get("avg_recovery_days") is not None else float(HIST_RECOVERY_LOOKBACK + 1)
+            max_drawdown_norm = float(hist_context.get("max_drawdown")) if hist_context and hist_context.get("max_drawdown") is not None else 0.0
+            
             indicator_results.append({
                 "symbol": symbol,
-                "rsi": latest['rsi'],
-                "atr": latest['atr'],
-                "atr_pct": latest['atr'] * 100,  # Convert to percentage
-                "macd": latest.get('macd', 0),
-                "sentiment": latest.get('sentiment', 0),
+                "rsi": rsi_norm,
+                "atr": atr_norm,
+                "atr_pct": atr_pct_norm,
+                "macd": macd_norm,
+                "sentiment": sentiment_norm,
                 "volume": latest.get('volume', 0),
                 "ema_crossover": latest['ema_crossover'],
                 "volume_ratio": latest['volume_ratio'],
                 "slope": latest['slope'],
                 "gap": latest['gap'],
                 "score": score,
-                "hist_volatility": hist_context.get("hist_volatility") if hist_context else None,
-                "avg_recovery_days": hist_context.get("avg_recovery_days") if hist_context else None,
-                "max_drawdown": hist_context.get("max_drawdown") if hist_context else None,
+                "hist_volatility": hist_volatility_norm,
+                "avg_recovery_days": avg_recovery_days_norm,
+                "max_drawdown": max_drawdown_norm,
             })
 
-    logging.info(f"{len(indicator_results)} tickers gathered with indicators after screening.")
+    # STEP 5: Lightweight logging (no spam)
+    early_session_count = sum(1 for r in indicator_results if len(df) < 60) if df is not None else 0
+    is_early_session = early_session_count > len(indicator_results) * 0.5
+    logging.info(f"[AI-Selector] Normalized {len(indicator_results)} symbols | early_session={is_early_session}")
     return indicator_results
 
 
@@ -784,19 +818,29 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
             continue
 
         tickers.append(symbol)
+        # STEP 4: Consistent row payload for Supabase (never NULL numerics)
+        score_norm = float(r.get("score")) if r.get("score") is not None else 0.0
+        rsi_norm = float(r.get("rsi")) if r.get("rsi") is not None else 50.0
+        atrp_norm = float(r.get("atr_pct")) if r.get("atr_pct") is not None else 100.0
+        macd_norm = float(r.get("macd")) if r.get("macd") is not None else 0.0
+        sentiment_norm = float(r.get("sentiment")) if r.get("sentiment") is not None else 0.0
+        hist_volatility_norm = float(r.get("hist_volatility")) if r.get("hist_volatility") is not None else 0.0
+        avg_recovery_days_norm = float(r.get("avg_recovery_days")) if r.get("avg_recovery_days") is not None else float(HIST_RECOVERY_LOOKBACK + 1)
+        max_drawdown_norm = float(r.get("max_drawdown")) if r.get("max_drawdown") is not None else 0.0
+        
         rows.append({
             "user_id": user_id,
             "mode": mode,
             "ticker": symbol,
             "rank": idx,
-            "score": float(r.get("score") or 0.0),
-            "rsi": float(r.get("rsi") or 0.0),
-            "atrp": float(r.get("atr_pct") or 0.0),
-            "macd": float(r.get("macd") or 0.0),
-            "sentiment": float(r.get("sentiment") or 0.0),
-            "hist_volatility": r.get("hist_volatility"),
-            "avg_recovery_days": r.get("avg_recovery_days"),
-            "max_drawdown": r.get("max_drawdown"),
+            "score": score_norm,
+            "rsi": rsi_norm,
+            "atrp": atrp_norm,
+            "macd": macd_norm,
+            "sentiment": sentiment_norm,
+            "hist_volatility": hist_volatility_norm,
+            "avg_recovery_days": avg_recovery_days_norm,
+            "max_drawdown": max_drawdown_norm,
         })
 
     if not rows:

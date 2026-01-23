@@ -89,6 +89,9 @@ HIST_RECOVERY_LOOKBACK = 20
 BAD_DATA_COOLDOWN_SECONDS = 6 * 60 * 60  # 6 hours
 _BAD_DATA_REGISTRY = {}  # symbol -> last_failed_timestamp
 
+# 6) Stability Bias (soft memory)
+_STABILITY_TRACKER = {}  # symbol -> {"appearances": int, "clean_resolutions": int, "last_seen": timestamp}
+
 def compute_rsi(series, period):
     delta = series.diff()
     gain = delta.where(delta > 0, 0).rolling(window=period).mean()
@@ -301,15 +304,78 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             latest = df.iloc[-1]
             logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
             
-            # Calculate initial score
-            score = unified_ai_score(
+            # 1) Market Regime Classification (internal only)
+            regime = "transition"  # default
+            if not pd.isna(latest['slope']) and not pd.isna(latest['ema_fast']) and not pd.isna(latest['ema_slow']):
+                if latest['slope'] > 0.001 and latest['ema_fast'] > latest['ema_slow']:
+                    regime = "trend"
+                elif abs(latest['slope']) < 0.0005:
+                    regime = "range"
+            
+            # 2) Volatility Expansion Bias (soft only)
+            atr_expansion_bias = 0.0
+            if len(df) >= 20:
+                recent_atr = df['atr'].tail(10)
+                if not recent_atr.empty and not pd.isna(recent_atr.iloc[-1]):
+                    current_atr = recent_atr.iloc[-1]
+                    mean_atr = recent_atr.mean()
+                    if current_atr <= mean_atr * 0.95:  # ATR contracting
+                        atr_expansion_bias = -0.1  # small penalty
+            
+            # 4) Candle Structure Awareness (heuristic only)
+            candle_structure_bias = 0.0
+            if len(df) >= 15:
+                recent_bars = df.tail(15)
+                if not recent_bars.empty:
+                    # Simple heuristics for structure detection
+                    recent_ranges = recent_bars['high'] - recent_bars['low']
+                    avg_range = recent_ranges.mean() if not recent_ranges.empty else 0
+                    latest_range = recent_ranges.iloc[-1] if len(recent_ranges) > 0 else 0
+                    
+                    # Check for higher highs/lows pattern
+                    highs = recent_bars['high'].tail(5)
+                    lows = recent_bars['low'].tail(5)
+                    
+                    if len(highs) >= 3 and len(lows) >= 3:
+                        # Impulsive: expanding ranges + higher highs
+                        if latest_range > avg_range * 1.2 and highs.iloc[-1] > highs.iloc[-3]:
+                            candle_structure_bias = 0.15  # positive bias for impulsive
+                        # Compressing: shrinking ranges
+                        elif latest_range < avg_range * 0.7:
+                            candle_structure_bias = -0.1  # penalty for compression
+            
+            # Calculate initial score with enhanced unified_ai_score
+            score = enhanced_unified_ai_score(
                 rsi=latest['rsi'],
                 atr=latest['atr'],
                 ema_crossover=latest['ema_crossover'],
                 volume_ratio=latest['volume_ratio'],
                 slope=latest['slope'],
                 gap=latest['gap'],
+                regime=regime,
+                atr_expansion_bias=atr_expansion_bias,
+                candle_structure_bias=candle_structure_bias
             ) or 0.0
+            
+            # 6) Stability Bias (soft memory)
+            stability_bias = 0.0
+            stability_data = _STABILITY_TRACKER.get(symbol, {"appearances": 0, "clean_resolutions": 0})
+            if stability_data["appearances"] > 0:
+                resolution_rate = stability_data["clean_resolutions"] / stability_data["appearances"]
+                if resolution_rate > 0.6:
+                    stability_bias = 0.1  # reward consistent performers
+                elif resolution_rate < 0.3 and stability_data["appearances"] >= 3:
+                    stability_bias = -0.1  # penalize frequent non-performers
+            
+            # Update stability tracker
+            _STABILITY_TRACKER[symbol] = {
+                "appearances": stability_data["appearances"] + 1,
+                "clean_resolutions": stability_data["clean_resolutions"],
+                "last_seen": time.time()
+            }
+            
+            # Apply stability bias to score
+            score += stability_bias
             
             # Apply historical context modifier (Step 3)
             hist_context = compute_historical_context(symbol, mode)
@@ -355,38 +421,50 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             score = np.tanh(score)
             score = max(0.01, score)
             
-            # STEP 1: Normalize ALL AI output fields (never None)
-            rsi_norm = float(latest['rsi']) if latest['rsi'] is not None and not pd.isna(latest['rsi']) else 50.0
-            atr_norm = float(latest['atr']) if latest['atr'] is not None and not pd.isna(latest['atr']) else 1.0
-            atr_pct_norm = float(atr_norm * 100) if atr_norm is not None else 100.0
-            macd_norm = float(latest.get('macd', 0)) if latest.get('macd') is not None else 0.0
-            sentiment_norm = float(latest.get('sentiment', 0)) if latest.get('sentiment') is not None else 0.0
-            hist_volatility_norm = float(hist_context.get("hist_volatility")) if hist_context and hist_context.get("hist_volatility") is not None else 0.0
-            avg_recovery_days_norm = int(hist_context.get("avg_recovery_days")) if hist_context and hist_context.get("avg_recovery_days") is not None else int(HIST_RECOVERY_LOOKBACK + 1)
-            max_drawdown_norm = float(hist_context.get("max_drawdown")) if hist_context and hist_context.get("max_drawdown") is not None else 0.0
-            
-            indicator_results.append({
-                "symbol": symbol,
-                "rsi": rsi_norm,
-                "atr": atr_norm,
-                "atr_pct": atr_pct_norm,
-                "macd": macd_norm,
-                "sentiment": sentiment_norm,
-                "volume": latest.get('volume', 0),
-                "ema_crossover": latest['ema_crossover'],
-                "volume_ratio": latest['volume_ratio'],
-                "slope": latest['slope'],
-                "gap": latest['gap'],
-                "score": score,
-                "hist_volatility": hist_volatility_norm,
-                "avg_recovery_days": avg_recovery_days_norm,
-                "max_drawdown": max_drawdown_norm,
-            })
+            # 5) Opportunity Scarcity (pre-score filtering)
+            # Only add to results if score meets minimum quality threshold
+            if score >= 0.15:  # Allow fewer but higher-quality candidates
+                # STEP 1: Normalize ALL AI output fields (never None)
+                rsi_norm = float(latest['rsi']) if latest['rsi'] is not None and not pd.isna(latest['rsi']) else 50.0
+                atr_norm = float(latest['atr']) if latest['atr'] is not None and not pd.isna(latest['atr']) else 1.0
+                atr_pct_norm = float(atr_norm * 100) if atr_norm is not None else 100.0
+                macd_norm = float(latest.get('macd', 0)) if latest.get('macd') is not None else 0.0
+                sentiment_norm = float(latest.get('sentiment', 0)) if latest.get('sentiment') is not None else 0.0
+                hist_volatility_norm = float(hist_context.get("hist_volatility")) if hist_context and hist_context.get("hist_volatility") is not None else 0.0
+                avg_recovery_days_norm = int(hist_context.get("avg_recovery_days")) if hist_context and hist_context.get("avg_recovery_days") is not None else int(HIST_RECOVERY_LOOKBACK + 1)
+                max_drawdown_norm = float(hist_context.get("max_drawdown")) if hist_context and hist_context.get("max_drawdown") is not None else 0.0
+                
+                indicator_results.append({
+                    "symbol": symbol,
+                    "rsi": rsi_norm,
+                    "atr": atr_norm,
+                    "atr_pct": atr_pct_norm,
+                    "macd": macd_norm,
+                    "sentiment": sentiment_norm,
+                    "volume": latest.get('volume', 0),
+                    "ema_crossover": latest['ema_crossover'],
+                    "volume_ratio": latest['volume_ratio'],
+                    "slope": latest['slope'],
+                    "gap": latest['gap'],
+                    "score": score,
+                    "hist_volatility": hist_volatility_norm,
+                    "avg_recovery_days": avg_recovery_days_norm,
+                    "max_drawdown": max_drawdown_norm,
+                })
 
-    # STEP 5: Lightweight logging (no spam)
+    # STEP 5: Enhanced logging with comprehensive summary
     early_session_count = sum(1 for r in indicator_results if len(df) < 60) if df is not None else 0
     is_early_session = early_session_count > len(indicator_results) * 0.5
-    logging.info(f"[AI-Selector] Normalized {len(indicator_results)} symbols | early_session={is_early_session}")
+    
+    # Count quality tiers for opportunity scarcity insight
+    high_quality_count = sum(1 for r in indicator_results if r.get('score', 0) > 0.5)
+    symbols_analysed = len(symbols_for_indicators)
+    symbols_returned = len(indicator_results)
+    
+    logging.info(
+        f"[AI-Selector] Analyzed: {symbols_analysed} | Returned: {symbols_returned} | "
+        f"High-quality: {high_quality_count} | Early-session: {is_early_session}"
+    )
     return indicator_results
 
 
@@ -402,6 +480,85 @@ def get_open_position_symbols(mode: str):
     except Exception as e:
         logging.warning(f"Failed to retrieve open positions: {e}")
         return set()
+
+def enhanced_unified_ai_score(
+    rsi: float,
+    atr: float,
+    ema_crossover: bool,
+    volume_ratio: float,
+    slope: float,
+    gap: float,
+    regime: str = "transition",
+    atr_expansion_bias: float = 0.0,
+    candle_structure_bias: float = 0.0,
+) -> Optional[float]:
+    """
+    Enhanced unified multi-factor score with market context awareness.
+    Builds upon the original unified_ai_score with new regime and structure intelligence.
+    """
+    # Require RSI
+    if pd.isna(rsi):
+        return None
+
+    # Safe defaults for other indicators
+    if pd.isna(atr) or atr <= 0:
+        atr = 1.0
+    if pd.isna(volume_ratio) or volume_ratio <= 0:
+        volume_ratio = 1.0
+    if pd.isna(slope):
+        slope = 0.0
+    if pd.isna(gap):
+        gap = 0.0
+
+    score = 0.0
+
+    # 3) RSI Context Reinterpretation (bias only, not entry signal)
+    if 40 <= rsi <= 60:
+        score += 0.1  # slight penalty for neutral RSI
+    elif rsi > 60 and regime == "trend":
+        score += 0.4  # positive bias for momentum in trend
+    elif rsi < 40 and regime == "trend":
+        score -= 0.2  # negative bias for weakness in trend
+    elif 25 <= rsi <= 80:
+        score += 0.2  # acceptable range bonus
+    else:
+        score -= 0.5  # penalty for extreme RSI
+
+    # 2) ATR: prefer reasonable volatility with regime context
+    atr_clamped = min(max(atr, 0.01), 5.0)
+    base_atr_score = 0.5 / atr_clamped
+    if regime == "trend":
+        base_atr_score *= 1.1  # slight boost for volatility in trends
+    score += base_atr_score
+
+    # 3) EMA crossover: bullish alignment (bonus, not decisive)
+    if ema_crossover:
+        crossover_bonus = 0.5
+        if regime == "trend":
+            crossover_bonus *= 1.2  # stronger bonus in trend regime
+        score += crossover_bonus
+
+    # 4) Volume ratio: prefer above-average volume, cap contribution
+    if volume_ratio > 1.0:
+        score += min(1.5, (volume_ratio - 1.0) / 2.0)
+
+    # 5) Slope: upward trend is good, context-aware
+    if slope > 0:
+        slope_score = min(1.5, slope * 100.0)
+        if regime == "range":
+            slope_score *= 0.7  # reduce slope importance in range-bound markets
+        score += slope_score
+
+    # 6) Gap: very large gaps are risky; small gaps can be constructive
+    if abs(gap) > 0.10:
+        score -= 1.0
+    elif abs(gap) > 0.02:
+        score += 0.2
+
+    # Apply new bias factors
+    score += atr_expansion_bias + candle_structure_bias
+
+    return score
 
 def unified_ai_score(
     rsi: float,

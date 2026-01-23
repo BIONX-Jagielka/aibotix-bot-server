@@ -810,6 +810,104 @@ def ny_now():
     """Shorthand for now in NY timezone."""
     return datetime.datetime.now(ny_tz)
 
+# A) ENTRY QUALITY: Helper functions for confirmation-first approach
+def check_entry_confirmation(df: pd.DataFrame, atr_pct: float) -> bool:
+    """Entry confirmation gate using only existing df data. Returns True if conditions pass."""
+    if df is None or len(df) < 20:
+        return False
+    
+    try:
+        # 1) Trend alignment: require close above short EMA
+        close_series = df['close']
+        short_ema = close_series.ewm(span=9).mean()
+        current_close = close_series.iloc[-1]
+        current_ema = short_ema.iloc[-1]
+        
+        if current_close <= current_ema:
+            return False
+        
+        # 2) Breakout OR pullback confirmation
+        highs_10 = df['high'].tail(10)
+        prior_high = highs_10.iloc[:-1].max() if len(highs_10) > 1 else highs_10.iloc[-1]
+        current_high = df['high'].iloc[-1]
+        current_low = df['low'].iloc[-1]
+        current_open = df['open'].iloc[-1] if 'open' in df.columns else current_close
+        
+        # Breakout: close > prior 10-bar high AND candle body >= 40% of range
+        candle_range = current_high - current_low
+        candle_body = abs(current_close - current_open)
+        breakout_ok = (current_close > prior_high and 
+                      candle_range > 0 and 
+                      candle_body >= 0.4 * candle_range)
+        
+        # Pullback: price above EMA, current candle green after mild pullback
+        prev_close = close_series.iloc[-2] if len(close_series) > 1 else current_close
+        pullback_ok = (current_close >= current_ema and 
+                      current_close >= prev_close and 
+                      current_low <= current_ema * 1.005)  # small tolerance
+        
+        if not (breakout_ok or pullback_ok):
+            return False
+        
+        # 3) Volatility sanity: ATR_PCT rising or stable
+        if 'ATR_PCT' in df.columns and len(df) >= 5:
+            recent_atr = df['ATR_PCT'].tail(5)
+            if len(recent_atr) >= 2:
+                atr_slope = recent_atr.iloc[-1] - recent_atr.iloc[0]
+                if atr_slope < -0.001:  # contracting volatility
+                    return False
+        
+        return True
+        
+    except Exception:
+        return False  # Safe fallback
+
+def check_anti_chop_filter(df: pd.DataFrame) -> bool:
+    """Returns False if market is choppy (alternating green/red > 70%). True = OK to enter."""
+    if df is None or len(df) < 10:
+        return True  # Not enough data, allow entry
+    
+    try:
+        last_10 = df.tail(10)
+        if 'open' not in last_10.columns:
+            return True  # No open data, allow entry
+        
+        # Count alternating candles
+        candle_colors = []
+        for _, row in last_10.iterrows():
+            candle_colors.append(1 if row['close'] >= row['open'] else 0)  # 1=green, 0=red
+        
+        if len(candle_colors) < 8:
+            return True
+        
+        # Count alternations
+        alternations = 0
+        for i in range(1, len(candle_colors)):
+            if candle_colors[i] != candle_colors[i-1]:
+                alternations += 1
+        
+        alternation_rate = alternations / (len(candle_colors) - 1)
+        return alternation_rate <= 0.7  # Allow if <= 70% alternating
+        
+    except Exception:
+        return True  # Safe fallback
+
+# B) Loss clustering detection
+def check_loss_cluster() -> bool:
+    """Returns True if loss clustering detected and buy pause should be applied."""
+    now = ny_now()
+    recent_losses = []
+    
+    # Check all tickers for recent losses within 30 minutes
+    for ticker_data in SESSION.trade_history.values():
+        if 'last_loss' in ticker_data:
+            loss_time = ticker_data['last_loss']
+            if (now - loss_time).total_seconds() <= 1800:  # 30 minutes
+                recent_losses.append(loss_time)
+    
+    # If 2+ losses within 30 minutes, trigger pause
+    return len(recent_losses) >= 2
+
 def mark_exec_bad_ticker(ticker: str, reason: str):
     # Defensive guard for future refactors / early calls
     if not hasattr(SESSION, "bad_ticker_until"):
@@ -873,6 +971,14 @@ def place_order(symbol, qty, side):
         SESSION.api.submit_order(order)
         logging.info(f"Order {side.upper()} {symbol} @ {datetime.datetime.now(ny_tz)} with quantity {qty}")
         SESSION.last_trade_time[symbol] = datetime.datetime.now(ny_tz)
+
+        # F) Track opening time and first trade status for BUY orders
+        if side.lower() == 'buy':
+            SESSION.trade_history[symbol] = SESSION.trade_history.get(symbol, {})
+            SESSION.trade_history[symbol]['opened_at'] = ny_now()
+            # Mark first trade as done on successful BUY
+            if not SESSION.first_trade_done:
+                SESSION.first_trade_done = True
 
         # --- Supabase log order submitted (schema-safe) ---
         supabase_log(
@@ -1256,7 +1362,7 @@ INDICATOR_WEIGHTS = {
 # --- Signal thresholds & trade guards ---
 SIGNAL_BUY_THRESHOLD = 0.17   # how strong the combined signal must be to enter
 SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
-MICRO_PROFIT_TAKE = 0.001   # 0.10% fast profit snap exit
+MICRO_PROFIT_TAKE = 0.002   # 0.10% fast profit snap exit
 
 # === Tiered Execution Thresholds ===
 TIER1_THRESHOLD_MULT = 1.00   # full confidence
@@ -1776,97 +1882,127 @@ async def process_ticker(ticker):
             return
 
         # ================ SMART EXIT LOGIC (if holding) ================
-        # ---- Simplified Unified SMART EXIT LOGIC ----
+        # C) FIX EXIT LOGIC CONFLICTS WITH BRACKET ORDERS
         if have_position:
-            # Calculate current PnL
-            pnl_pct = 0.0
-            if entry_price > 0:
-                pnl_pct = (close_price - entry_price) / entry_price
-
-            # Track peak for reversal detection
-            peak_key = f"{ticker}_peak_pnl"
-            prev_peak = SESSION.recently_traded.get(peak_key, 0.0)
-            new_peak = max(prev_peak, pnl_pct)
-            SESSION.recently_traded[peak_key] = new_peak
-
-            # Thresholds
-            MIN_LOCK_PROFIT = 0.001   # 0.1%
-            REVERSAL_DROP   = 0.001   # 0.1%
-            BASE_TP         = 0.03    # 3%
-            EXT_TP          = 0.05    # 5%
-
-            # Micro-profit snap exit (fast profit lock), skip for high-confidence trades
-            if pnl_pct >= MICRO_PROFIT_TAKE and score < SIGNAL_BUY_THRESHOLD * 1.25:
-                pnl = close_position(ticker)
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                supabase_log(f"micro_tp_exit | {ticker} | pnl={pnl_pct:.2%}")
-                return
-
-            # 1. Faster defensive loss exit at -0.3%
-            if pnl_pct <= -0.003:
-                pnl = close_position(ticker)
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                supabase_log(f"defensive_exit | {ticker} | pnl={pnl_pct:.2%}")
-                return
-
-            # 2. Exit if losing and score turns bad
-            if pnl_pct <= 0 and score <= SIGNAL_SELL_THRESHOLD:
-                pnl = close_position(ticker)
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                logging.info(f"[EXIT] Defensive loss exit {ticker} | pnl={pnl_pct:.2%}")
-                return
-
-            # 3. Reversal exit protecting >0.1% profits
-            if pnl_pct >= MIN_LOCK_PROFIT and (new_peak - pnl_pct) >= REVERSAL_DROP:
-                pnl = close_position(ticker)
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                logging.info(f"[EXIT] Reversal exit {ticker} | pnl={pnl_pct:.2%}, peak={new_peak:.2%}")
-                return
-
-            # 4. Standard 3% take-profit unless momentum strong
-            if BASE_TP <= pnl_pct < EXT_TP:
-                momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 70)
-                if momentum_weak:
+            # When bracket orders are enabled, only run emergency and market close exits
+            if BRACKET_ORDERS_ENABLED:
+                # Calculate current PnL for emergency check
+                pnl_pct = 0.0
+                if entry_price > 0:
+                    pnl_pct = (close_price - entry_price) / entry_price
+                
+                # 1) Emergency kill-switch: hard protective override
+                if pnl_pct <= -0.006:  # -0.6%
                     pnl = close_position(ticker)
                     SESSION.recently_traded[ticker] = ny_now()
                     SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                    logging.info(f"[EXIT] Base 3% TP exit {ticker} | pnl={pnl_pct:.2%}")
+                    supabase_log(f"emergency_exit | {ticker} | pnl={pnl_pct:.2%}")
                     return
+                
+                # 2) Market closeout logic will handle closing positions at market close
+                # (existing close_all_positions and closeout-window logic remains intact)
+                
+            else:
+                # E) OVERTRADING CONTROL: Check minimum hold time for discretionary exits
+                opened_at = SESSION.trade_history.get(ticker, {}).get('opened_at')
+                if opened_at:
+                    hold_time_seconds = (ny_now() - opened_at).total_seconds()
+                    if hold_time_seconds < 120:  # 2 minutes minimum hold
+                        # Allow emergency exits but skip discretionary ones
+                        pnl_pct = (close_price - entry_price) / entry_price if entry_price > 0 else 0.0
+                        if pnl_pct > -0.006:  # Not an emergency
+                            return
+                
+                # ---- Original Simplified Unified SMART EXIT LOGIC (when brackets disabled) ----
+                # Calculate current PnL
+                pnl_pct = 0.0
+                if entry_price > 0:
+                    pnl_pct = (close_price - entry_price) / entry_price
 
-            # 5. High-profit exit above 5% if momentum weakens
-            if pnl_pct >= EXT_TP:
-                momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 72)
-                if momentum_weak:
+                # Track peak for reversal detection
+                peak_key = f"{ticker}_peak_pnl"
+                prev_peak = SESSION.recently_traded.get(peak_key, 0.0)
+                new_peak = max(prev_peak, pnl_pct)
+                SESSION.recently_traded[peak_key] = new_peak
+
+                # Thresholds
+                MIN_LOCK_PROFIT = 0.001   # 0.1%
+                REVERSAL_DROP   = 0.001   # 0.1%
+                BASE_TP         = 0.03    # 3%
+                EXT_TP          = 0.05    # 5%
+
+                # Micro-profit snap exit (fast profit lock), skip for high-confidence trades
+                if pnl_pct >= MICRO_PROFIT_TAKE and score < SIGNAL_BUY_THRESHOLD * 1.25:
                     pnl = close_position(ticker)
                     SESSION.recently_traded[ticker] = ny_now()
                     SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                    logging.info(f"[EXIT] High-profit exit {ticker} | pnl={pnl_pct:.2%}")
+                    supabase_log(f"micro_tp_exit | {ticker} | pnl={pnl_pct:.2%}")
                     return
 
-            # 6. Fallback trailing stop
-            trail_amount = atr * STOP_LOSS_ATR_MULT
-            prev_stop = SESSION.recently_traded.get(f"{ticker}_stop", entry_price - trail_amount)
-            new_stop = update_trailing_stop(entry_price, close_price, trail_amount, prev_stop)
-            SESSION.recently_traded[f"{ticker}_stop"] = new_stop
+                # 1. Faster defensive loss exit at -0.3%
+                if pnl_pct <= -0.003:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    supabase_log(f"defensive_exit | {ticker} | pnl={pnl_pct:.2%}")
+                    return
 
-            if close_price <= new_stop:
-                pnl = close_position(ticker)
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                logging.info(f"[EXIT] Trailing stop exit {ticker}")
-                return
+                # 2. Exit if losing and score turns bad
+                if pnl_pct <= 0 and score <= SIGNAL_SELL_THRESHOLD:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    logging.info(f"[EXIT] Defensive loss exit {ticker} | pnl={pnl_pct:.2%}")
+                    return
 
-            # 7. RSI safety exit
-            if not pd.isna(rsi) and rsi >= 75 and pnl_pct > 0:
-                pnl = close_position(ticker)
-                SESSION.recently_traded[ticker] = ny_now()
-                SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                logging.info(f"[EXIT] RSI overbought safety exit {ticker} | rsi={rsi:.1f}")
-                return
+                # 3. Reversal exit protecting >0.1% profits
+                if pnl_pct >= MIN_LOCK_PROFIT and (new_peak - pnl_pct) >= REVERSAL_DROP:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    logging.info(f"[EXIT] Reversal exit {ticker} | pnl={pnl_pct:.2%}, peak={new_peak:.2%}")
+                    return
+
+                # 4. Standard 3% take-profit unless momentum strong
+                if BASE_TP <= pnl_pct < EXT_TP:
+                    momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 70)
+                    if momentum_weak:
+                        pnl = close_position(ticker)
+                        SESSION.recently_traded[ticker] = ny_now()
+                        SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                        logging.info(f"[EXIT] Base 3% TP exit {ticker} | pnl={pnl_pct:.2%}")
+                        return
+
+                # 5. High-profit exit above 5% if momentum weakens
+                if pnl_pct >= EXT_TP:
+                    momentum_weak = (score < SIGNAL_BUY_THRESHOLD) or (not pd.isna(rsi) and rsi >= 72)
+                    if momentum_weak:
+                        pnl = close_position(ticker)
+                        SESSION.recently_traded[ticker] = ny_now()
+                        SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                        logging.info(f"[EXIT] High-profit exit {ticker} | pnl={pnl_pct:.2%}")
+                        return
+
+                # 6. Fallback trailing stop
+                trail_amount = atr * STOP_LOSS_ATR_MULT
+                prev_stop = SESSION.recently_traded.get(f"{ticker}_stop", entry_price - trail_amount)
+                new_stop = update_trailing_stop(entry_price, close_price, trail_amount, prev_stop)
+                SESSION.recently_traded[f"{ticker}_stop"] = new_stop
+
+                if close_price <= new_stop:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    logging.info(f"[EXIT] Trailing stop exit {ticker}")
+                    return
+
+                # 7. RSI safety exit
+                if not pd.isna(rsi) and rsi >= 75 and pnl_pct > 0:
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    logging.info(f"[EXIT] RSI overbought safety exit {ticker} | rsi={rsi:.1f}")
+                    return
 
         # If we're still holding after exit checks, do not evaluate entry logic for this ticker
         if have_position:
@@ -1886,14 +2022,33 @@ async def process_ticker(ticker):
         if get_open_position_count() >= MAX_CONCURRENT_POSITIONS:
             return
             
+        # B) STOP LOSS CLUSTERING: Check for loss cluster and apply pause
+        if check_loss_cluster() and not SESSION.buy_pause_until:
+            SESSION.buy_pause_until = ny_now() + datetime.timedelta(minutes=20)
+            reason_log("loss_cluster_pause", "loss_cluster | pause_applied | 20min", min_seconds=300)
+            
         # Defensive mode: Check if BUY entries are paused
         if SESSION.buy_pause_until:
             if datetime.datetime.now(ny_tz) < SESSION.buy_pause_until:
-                logging.info(f"[DEFENSIVE MODE] Buy paused until {SESSION.buy_pause_until}")
                 return
             else:
                 SESSION.buy_pause_until = None
                 supabase_log("defensive_mode | buy_resumed")
+        
+        # B) Re-entry after loss rule
+        last_loss_time = SESSION.trade_history.get(ticker, {}).get('last_loss')
+        if last_loss_time:
+            time_since_loss = (ny_now() - last_loss_time).total_seconds() / 60  # minutes
+            if time_since_loss < 45:  # 45 minute minimum after loss
+                return
+        
+        # A) ENTRY QUALITY: Entry confirmation gate
+        if not check_entry_confirmation(df, atr_pct):
+            return
+        
+        # E) OVERTRADING CONTROL: Anti-chop filter
+        if not check_anti_chop_filter(df):
+            return
         
         # Phase 1 Safety: Block new entries in last 30 minutes of market
         if is_last_30_minutes_of_market():
@@ -2029,57 +2184,38 @@ async def process_ticker(ticker):
         if should_halt_trading():
             return
 
-        qty = calculate_position_size(ticker, RISK_PER_TRADE)
-
-        # Apply risk state scaling
-        if SESSION.risk_state == "DEGRADED":
-            qty = qty * 0.5  # Reduce position size in degraded state
-            logging.debug(f"[RISK SCALING] {ticker} | DEGRADED state - reduced position size by 50%")
-        elif SESSION.risk_state == "HALT":
-            # Should not reach here as should_halt_trading() should prevent this
-            return
-
-        # Tier-based size adjustment
-        if tier == "TIER1":
-            qty = qty * 1.35   # confidence boost for strong setups
-        elif tier == "TIER2":
-            qty = qty * TIER2_SIZE_MULT
-        elif tier == "MVT":
-            qty = qty * 0.40
-        elif tier == "PARTIAL":
-            qty = qty * PARTIAL_ENTRY_MULTIPLIER
+        # D) MAKE POSITION SIZING CONSISTENT WITH QUALITY SCORE + HISTORICAL HINT MULTIPLIER
+        base_qty = calculate_position_size(ticker, RISK_PER_TRADE)
         
-        # Scale quantity based on signal score
-        qty = scale_qty_by_score(qty, score)
+        # Apply risk state scaling first
+        if SESSION.risk_state == "DEGRADED":
+            base_qty *= 0.5  # 50% reduction in DEGRADED state
+        elif SESSION.risk_state == "HALT":
+            return  # No new positions in HALT state
+
+        # Step 1: Scale by score
+        qty1 = scale_qty_by_score(base_qty, score)
+        
+        # Step 2: Apply historical hint multiplier
+        qty2, hist_mult, hist_hint = apply_historical_hint_multiplier(ticker, qty1)
+        
+        # Step 3: Additional degraded state soft scaling
+        if SESSION.risk_state == "DEGRADED":
+            qty2 *= 0.65  # Additional soft reduction
+        
+        # Final quantity
+        qty = qty2
+        
+        # Throttled logging for hint application
+        if hist_hint is not None and hist_mult != 1.0:
+            reason_log(
+                f"hist_hint_{ticker}", 
+                f"hist_hint_applied | {ticker} | mult={hist_mult:.2f}", 
+                min_seconds=600  # 10 minutes
+            )
 
         if qty <= 0:
             return
-
-        # Market regime-aware position sizing adjustment
-        if regime == "MEAN_REVERSION":
-            # Reduce position size by 40% for mean reversion trades (higher risk of false signals)
-            qty = qty * 0.6
-            logging.debug(f"[REGIME SIZING] {ticker} | MEAN_REVERSION regime - reduced position size by 40%")
-
-        if regime == "SQUEEZE":
-            # SQUEEZE entries are allowed (unless too quiet), but size is reduced to limit risk.
-            qty = qty * 0.5
-            logging.debug(f"[REGIME SIZING] {ticker} | SQUEEZE regime - reduced position size by 50%")
-        
-        # === Phase 2.2: Apply historical hint sizing (SOFT; never blocks) ===
-        qty_before_hint = qty
-        qty, hist_mult, hist_hint = apply_historical_hint_multiplier(ticker, qty)
-
-        if hist_hint and hist_mult != 1.0:
-            reason_log(
-                f"hist_hint:{ticker}",
-                f"HistHint | {ticker} | mult={hist_mult:.2f} | hint={hist_hint}",
-                min_seconds=300
-            )
-        
-        # === Step 3: First trade confidence boost (controlled) ===
-        if tier in ("TIER1", "TIER2") and not SESSION.first_trade_done:
-            qty *= 1.5
         
         # Phase 1 Safety: Buying power guard
         required_dollars = qty * close_price
@@ -2111,6 +2247,20 @@ async def process_ticker(ticker):
         ui_event(f"Signal found: BUY setup for {ticker}. Attempting entry…")
 
         if await place_order_async(ticker, qty, 'buy'):
+            # G) OBSERVABILITY: Log consolidated cycle summary (throttled)
+            reason_log(
+                "cycle_summary",
+                f"cycle | risk={SESSION.risk_state} | daily_pnl={SESSION.daily_realized_pnl:.2f} | "
+                f"positions={get_open_position_count()} | market={SESSION.market_state}",
+                min_seconds=300  # 5 minutes
+            )
+            # G) OBSERVABILITY: Log consolidated cycle summary (throttled)
+            reason_log(
+                "cycle_summary",
+                f"cycle | risk={SESSION.risk_state} | daily_pnl={SESSION.daily_realized_pnl:.2f} | "
+                f"positions={get_open_position_count()} | market={SESSION.market_state}",
+                min_seconds=300  # 5 minutes
+            )
             SESSION.first_trade_done = True
             SESSION.recently_traded[ticker] = ny_now()
             SESSION.recently_traded[f"{ticker}_stop"] = close_price - (atr * STOP_LOSS_ATR_MULT)

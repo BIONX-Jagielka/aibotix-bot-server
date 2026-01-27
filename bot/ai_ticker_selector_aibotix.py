@@ -251,6 +251,7 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
     tradable = [
         a.symbol for a in assets
         if a.tradable
+        and a.fractionable
         and a.asset_class == "us_equity"
         and a.symbol.isalpha()
         and len(a.symbol) <= 5
@@ -494,14 +495,12 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                     "hist_volatility": hist_volatility_norm,
                     "avg_recovery_days": avg_recovery_days_norm,
                     "max_drawdown": max_drawdown_norm,
+                    "is_early_session": is_early_session,
                 })
 
     # Enhanced logging with comprehensive summary and skipped count
-    early_session_count = sum(
-        1 for r in indicator_results
-        if r.get("atr") is not None and r.get("atr_pct") is not None
-    )
-    is_early_session = early_session_count > (len(indicator_results) * 0.5)
+    early_session_count = sum(1 for r in indicator_results if r.get('is_early_session', False))
+    is_early_session = early_session_count > len(indicator_results) * 0.5
     
     # Count quality tiers for opportunity scarcity insight
     high_quality_count = sum(1 for r in indicator_results if r.get('score', 0) > 0.5)

@@ -448,11 +448,11 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             is_early_session = len(df) < 60
             if not is_early_session and df.index[-1] is not None:
                 # Check if most recent bar is within first 45 minutes of session
-                from datetime import time as dt_time, timedelta
+                from datetime import timedelta
                 try:
                     last_bar_time = df.index[-1].time() if hasattr(df.index[-1], 'time') else None
                     if last_bar_time:
-                        market_open = dt_time(9, 30)  # 9:30 AM ET
+                        market_open = datetime.strptime("09:30", "%H:%M").time()
                         early_cutoff = (datetime.combine(datetime.today(), market_open) + timedelta(minutes=45)).time()
                         is_early_session = last_bar_time <= early_cutoff
                 except:

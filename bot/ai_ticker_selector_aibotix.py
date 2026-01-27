@@ -89,6 +89,9 @@ HIST_RECOVERY_LOOKBACK = 20
 BAD_DATA_COOLDOWN_SECONDS = 6 * 60 * 60  # 6 hours
 _BAD_DATA_REGISTRY = {}  # symbol -> last_failed_timestamp
 
+# 3) BAD_DATA ESCALATION: track daily failures for extended cooldowns
+_DAILY_FAILURES = {}  # symbol -> {date: failure_count}
+
 # 6) Stability Bias (soft memory)
 _STABILITY_TRACKER = {}  # symbol -> {"appearances": int, "clean_resolutions": int, "last_seen": timestamp}
 
@@ -111,10 +114,24 @@ def _is_in_bad_data_cooldown(symbol: str) -> bool:
     ts = _BAD_DATA_REGISTRY.get(symbol)
     if ts is None:
         return False
-    return (time.time() - ts) < BAD_DATA_COOLDOWN_SECONDS
+    
+    # Check if symbol has escalated cooldown (24 hours for repeat daily failures)
+    today = datetime.now().strftime('%Y-%m-%d')
+    daily_failures = _DAILY_FAILURES.get(symbol, {})
+    failure_count = daily_failures.get(today, 0)
+    
+    cooldown_seconds = 24 * 60 * 60 if failure_count >= 2 else BAD_DATA_COOLDOWN_SECONDS
+    return (time.time() - ts) < cooldown_seconds
 
 def _mark_bad_data(symbol: str):
-    _BAD_DATA_REGISTRY[symbol] = time.time()
+    current_time = time.time()
+    _BAD_DATA_REGISTRY[symbol] = current_time
+    
+    # Track daily failures for escalation
+    today = datetime.now().strftime('%Y-%m-%d')
+    if symbol not in _DAILY_FAILURES:
+        _DAILY_FAILURES[symbol] = {}
+    _DAILY_FAILURES[symbol][today] = _DAILY_FAILURES[symbol].get(today, 0) + 1
 
 async def fetch_indicators(symbol: str, mode: str):
     try:
@@ -122,13 +139,23 @@ async def fetch_indicators(symbol: str, mode: str):
         bars_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=100)
         bars = data_client.get_stock_bars(bars_req).df
         if bars.empty:
-            logging.warning(f"No data returned for {symbol}")
             _mark_bad_data(symbol)
             return None
 
-        # Require a minimum number of bars so ATR / EMA / volume windows have data
-        if len(bars) < 30:
-            logging.warning(f"Not enough intraday bars for {symbol}, skipping.")
+        # 2) INTRADAY VIABILITY GATE: stricter requirements
+        # Require at least 45 intraday minute bars
+        if len(bars) < 45:
+            _mark_bad_data(symbol)
+            return None
+        
+        # Require total volume over last 20 bars > 15,000
+        if len(bars) >= 20:
+            recent_volume = bars['volume'].iloc[-20:].sum()
+            if recent_volume <= 15_000:
+                _mark_bad_data(symbol)
+                return None
+        else:
+            # Not enough bars for volume check
             _mark_bad_data(symbol)
             return None
 
@@ -141,12 +168,6 @@ async def fetch_indicators(symbol: str, mode: str):
         df['volume_ratio'] = df['volume'] / df['volume'].rolling(window=20).mean()
         df['gap'] = df['close'] / df['close'].shift(1) - 1
         df['slope'] = df['close'].rolling(window=5).apply(lambda x: (x.iloc[-1] - x.iloc[0]) / 5)
-
-        # Intraday liquidity validation (real money flow)
-        recent_volume = df['volume'].iloc[-20:].sum()
-        if recent_volume < 15_000:
-            logging.info(f"{symbol} rejected - insufficient intraday liquidity.")
-            return None
 
         return df
     except Exception as e:
@@ -235,6 +256,22 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
         and len(a.symbol) <= 5
         and a.exchange in ["NASDAQ", "NYSE"]
     ]
+    
+    # 1) SYMBOL PRE-FILTER: exclude problematic symbols before API calls
+    pre_filtered = []
+    for symbol in tradable:
+        # Exclude symbols ending with specific suffixes
+        if symbol.endswith(('W', 'WS', 'U', 'R', 'P')):
+            continue
+        # Exclude symbols containing digits
+        if any(char.isdigit() for char in symbol):
+            continue
+        # Exclude symbols longer than 5 characters (already handled above, but explicit)
+        if len(symbol) > 5:
+            continue
+        pre_filtered.append(symbol)
+    
+    tradable = pre_filtered
     logging.debug(f"Total tradable symbols retrieved: {len(tradable)}")
     logging.debug(f"First 10 tradable symbols: {tradable[:10]}")
     volume_filtered = []
@@ -294,35 +331,42 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
     tasks = [fetch_indicators(sym, mode) for sym in symbols_for_indicators]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # 4) LOGGING COMPRESSION: track skipped symbols for summary
+    skipped_invalid_count = 0
+    
     for symbol, df in zip(symbols_for_indicators, results):
         # Skip any exceptions returned by asyncio.gather
         if isinstance(df, Exception):
             logging.warning(f"Indicator task for {symbol} raised an exception: {df}")
             continue
 
-        if df is not None and len(df) > 10:
-            latest = df.iloc[-1]
-            logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
-            
-            # 1) Market Regime Classification (internal only)
-            regime = "transition"  # default
-            if not pd.isna(latest['slope']) and not pd.isna(latest['ema_fast']) and not pd.isna(latest['ema_slow']):
-                if latest['slope'] > 0.001 and latest['ema_fast'] > latest['ema_slow']:
-                    regime = "trend"
-                elif abs(latest['slope']) < 0.0005:
-                    regime = "range"
-            
-            # 2) Volatility Expansion Bias (soft only)
-            atr_expansion_bias = 0.0
-            if len(df) >= 20:
-                recent_atr = df['atr'].tail(10)
-                if not recent_atr.empty and not pd.isna(recent_atr.iloc[-1]):
-                    current_atr = recent_atr.iloc[-1]
-                    mean_atr = recent_atr.mean()
-                    if current_atr <= mean_atr * 0.95:  # ATR contracting
-                        atr_expansion_bias = -0.1  # small penalty
-            
-            # 4) Candle Structure Awareness (heuristic only)
+        if df is None:
+            skipped_invalid_count += 1
+            continue
+
+        # Now process valid dataframe
+        latest = df.iloc[-1]
+        logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
+        
+        # 1) Market Regime Classification (internal only)
+        regime = "transition"  # default
+        if not pd.isna(latest['slope']) and not pd.isna(latest['ema_fast']) and not pd.isna(latest['ema_slow']):
+            if latest['slope'] > 0.001 and latest['ema_fast'] > latest['ema_slow']:
+                regime = "trend"
+            elif abs(latest['slope']) < 0.0005:
+                regime = "range"
+        
+        # 2) Volatility Expansion Bias (soft only)
+        atr_expansion_bias = 0.0
+        if len(df) >= 20:
+            recent_atr = df['atr'].tail(10)
+            if not recent_atr.empty and not pd.isna(recent_atr.iloc[-1]):
+                current_atr = recent_atr.iloc[-1]
+                mean_atr = recent_atr.mean()
+                if current_atr <= mean_atr * 0.95:  # ATR contracting
+                    atr_expansion_bias = -0.1  # small penalty
+        
+        # 4) Candle Structure Awareness (heuristic only)
             candle_structure_bias = 0.0
             if len(df) >= 15:
                 recent_bars = df.tail(15)
@@ -404,11 +448,11 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             is_early_session = len(df) < 60
             if not is_early_session and df.index[-1] is not None:
                 # Check if most recent bar is within first 45 minutes of session
-                from datetime import time, timedelta
+                from datetime import time as dt_time, timedelta
                 try:
                     last_bar_time = df.index[-1].time() if hasattr(df.index[-1], 'time') else None
                     if last_bar_time:
-                        market_open = time(9, 30)  # 9:30 AM ET
+                        market_open = dt_time(9, 30)  # 9:30 AM ET
                         early_cutoff = (datetime.combine(datetime.today(), market_open) + timedelta(minutes=45)).time()
                         is_early_session = last_bar_time <= early_cutoff
                 except:
@@ -452,9 +496,12 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
                     "max_drawdown": max_drawdown_norm,
                 })
 
-    # STEP 5: Enhanced logging with comprehensive summary
-    early_session_count = sum(1 for r in indicator_results if len(df) < 60) if df is not None else 0
-    is_early_session = early_session_count > len(indicator_results) * 0.5
+    # Enhanced logging with comprehensive summary and skipped count
+    early_session_count = sum(
+        1 for r in indicator_results
+        if r.get("atr") is not None and r.get("atr_pct") is not None
+    )
+    is_early_session = early_session_count > (len(indicator_results) * 0.5)
     
     # Count quality tiers for opportunity scarcity insight
     high_quality_count = sum(1 for r in indicator_results if r.get('score', 0) > 0.5)
@@ -463,7 +510,8 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
     
     logging.info(
         f"[AI-Selector] Analyzed: {symbols_analysed} | Returned: {symbols_returned} | "
-        f"High-quality: {high_quality_count} | Early-session: {is_early_session}"
+        f"High-quality: {high_quality_count} | Early-session: {is_early_session} | "
+        f"Skipped {skipped_invalid_count} symbols due to intraday invalidity"
     )
     return indicator_results
 

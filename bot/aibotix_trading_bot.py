@@ -588,6 +588,9 @@ def get_risk_state():
 def update_risk_state():
     """Update risk state and log transitions."""
     new_state = get_risk_state()
+    if new_state not in ("NORMAL", "DEGRADED", "HALT"):
+        logging.error(f"Invalid risk state returned: {new_state}. Forcing NORMAL.")
+        new_state = "NORMAL"
     old_state = SESSION.risk_state
     
     if new_state != old_state:
@@ -1681,11 +1684,11 @@ async def trade_loop_async(allowed_tickers=None):
             risk_state = get_risk_state()
             
             # Only sleep in HALT state, not DEGRADED
-            if risk_state == RiskState.HALT:
+            if risk_state == "HALT":
                 logging.warning("Trading HALTED due to risk limits. Sleeping 5 minutes...")
                 await asyncio.sleep(300)
                 continue
-            elif risk_state == RiskState.DEGRADED:
+            elif risk_state == "DEGRADED":
                 logging.warning("Trading in DEGRADED state - reduced position sizes and stricter entry criteria")
                 # Continue trading with degraded conditions
 

@@ -1902,6 +1902,25 @@ async def process_ticker(ticker):
                     supabase_log(f"emergency_exit | {ticker} | pnl={pnl_pct:.2%}")
                     return
                 
+                # Peak giveback exit (bracket orders enabled)
+                peak_key = f"{ticker}_peak_pnl"
+                prev_peak = SESSION.recently_traded.get(peak_key, 0.0)
+                new_peak = max(prev_peak, pnl_pct)
+                SESSION.recently_traded[peak_key] = new_peak
+                giveback = new_peak - pnl_pct
+                
+                if (new_peak >= 0.0040 and pnl_pct >= 0.0010 and
+                    ((0.0040 <= new_peak < 0.0080 and giveback >= 0.0015) or
+                     (0.0080 <= new_peak < 0.0150 and giveback >= 0.0025) or
+                     (0.0150 <= new_peak < 0.0300 and giveback >= 0.0040) or
+                     (new_peak >= 0.0300 and giveback >= 0.0060))):
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    supabase_log(f"peak_giveback_exit | {ticker} | peak={new_peak:.4%} pnl={pnl_pct:.4%} giveback={giveback:.4%}")
+                    SESSION.recently_traded[peak_key] = 0.0
+                    return
+                
                 # 2) Market closeout logic will handle closing positions at market close
                 # (existing close_all_positions and closeout-window logic remains intact)
                 
@@ -1927,6 +1946,20 @@ async def process_ticker(ticker):
                 prev_peak = SESSION.recently_traded.get(peak_key, 0.0)
                 new_peak = max(prev_peak, pnl_pct)
                 SESSION.recently_traded[peak_key] = new_peak
+                
+                # Peak giveback exit (bracket orders disabled)
+                giveback = new_peak - pnl_pct
+                if (new_peak >= 0.0040 and pnl_pct >= 0.0010 and
+                    ((0.0040 <= new_peak < 0.0080 and giveback >= 0.0015) or
+                     (0.0080 <= new_peak < 0.0150 and giveback >= 0.0025) or
+                     (0.0150 <= new_peak < 0.0300 and giveback >= 0.0040) or
+                     (new_peak >= 0.0300 and giveback >= 0.0060))):
+                    pnl = close_position(ticker)
+                    SESSION.recently_traded[ticker] = ny_now()
+                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                    supabase_log(f"peak_giveback_exit | {ticker} | peak={new_peak:.4%} pnl={pnl_pct:.4%} giveback={giveback:.4%}")
+                    SESSION.recently_traded[peak_key] = 0.0
+                    return
 
                 # Thresholds
                 MIN_LOCK_PROFIT = 0.001   # 0.1%

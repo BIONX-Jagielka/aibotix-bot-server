@@ -115,7 +115,7 @@ class RiskState(Enum):
 
 # Alpaca data API imports for historical and latest trade data (v3)
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.requests import StockLatestTradeRequest, StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 
@@ -935,6 +935,12 @@ def place_order(symbol, qty, side):
         return False
     try:
         current_price = get_last_trade_price(symbol)
+        
+        # Get quote for reference pricing
+        bid, ask, mid, spread_pct = get_latest_quote(symbol)
+        ref_price = ask if side.lower() == 'buy' else bid
+        if ref_price is None:
+            ref_price = current_price
 
         # Compute ATR if we intend to use bracket orders on BUY
         atr_for_bracket = None
@@ -952,9 +958,9 @@ def place_order(symbol, qty, side):
         time_in_force = TimeInForce.DAY if is_fractional else TimeInForce.GTC
 
         # Build order (use OCO TP/SL when enabled and ATR available)
-        if BRACKET_ORDERS_ENABLED and side.lower() == 'buy' and current_price is not None and atr_for_bracket:
-            tp_price = round(current_price + (TAKE_PROFIT_ATR_MULT * atr_for_bracket), 2)
-            sl_price = round(current_price - (STOP_LOSS_ATR_MULT * atr_for_bracket), 2)
+        if BRACKET_ORDERS_ENABLED and side.lower() == 'buy' and ref_price is not None and atr_for_bracket:
+            tp_price = round(ref_price + (TAKE_PROFIT_ATR_MULT * atr_for_bracket), 2)
+            sl_price = round(ref_price - (STOP_LOSS_ATR_MULT * atr_for_bracket), 2)
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty_float,
@@ -979,6 +985,8 @@ def place_order(symbol, qty, side):
         if side.lower() == 'buy':
             SESSION.trade_history[symbol] = SESSION.trade_history.get(symbol, {})
             SESSION.trade_history[symbol]['opened_at'] = ny_now()
+            SESSION.trade_history[symbol]['entry_ref_price'] = ref_price if ref_price else 'N/A'
+            SESSION.trade_history[symbol]['entry_spread_pct'] = spread_pct if spread_pct is not None else 'N/A'
             # Mark first trade as done on successful BUY
             if not SESSION.first_trade_done:
                 SESSION.first_trade_done = True
@@ -1041,8 +1049,10 @@ def close_position(symbol):
         # Register outcome for streaks/halts
         _register_trade_outcome(symbol, pnl)
         # --- Supabase log position closed ---
+        entry_ref_price = SESSION.trade_history.get(symbol, {}).get('entry_ref_price', 'N/A')
+        entry_spread_pct = SESSION.trade_history.get(symbol, {}).get('entry_spread_pct', 'N/A')
         supabase_log(
-            f"position_closed | {symbol} | pnl={pnl:.2f} @ {datetime.datetime.now(ny_tz).isoformat()}"
+            f"position_closed | {symbol} | pnl={pnl:.2f} entry_ref={entry_ref_price} exit_price={current_price:.4f} spread_pct={entry_spread_pct} @ {datetime.datetime.now(ny_tz).isoformat()}"
         )
         
         # --- UI notification ---
@@ -1077,6 +1087,38 @@ def close_position(symbol):
     except Exception as e:
         logging.error(f"Failed to close {symbol}: {e}")
         return None
+
+def get_latest_quote(symbol):
+    """
+    Returns (bid, ask, mid, spread_pct).
+    Uses SESSION.data_client.
+    Fail-safe: return (None, None, None, None) on any error.
+    """
+    try:
+        if SESSION.data_client is None:
+            return (None, None, None, None)
+        
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        quote_response = SESSION.data_client.get_stock_latest_quote(req)
+        
+        if symbol not in quote_response:
+            return (None, None, None, None)
+            
+        quote = quote_response[symbol]
+        bid_price = getattr(quote, 'bid_price', None)
+        ask_price = getattr(quote, 'ask_price', None)
+        
+        if bid_price is None or ask_price is None or bid_price <= 0 or ask_price <= 0:
+            return (None, None, None, None)
+            
+        mid = (bid_price + ask_price) / 2
+        spread_pct = (ask_price - bid_price) / mid if mid > 0 else None
+        
+        return (bid_price, ask_price, mid, spread_pct)
+    except Exception as e:
+        logging.warning(f"Quote fetch failed for {symbol}: {e}")
+        return (None, None, None, None)
+
 # === Smart Ticker Recovery Lock structures and helpers ===
 class TickerRecoveryState:
     def __init__(self):
@@ -1323,14 +1365,18 @@ def fetch_data(symbol):
             return None
         
         df = strategy.calculate_indicators(df.copy())
-        df['RSI'] = df['RSI'].interpolate().bfill()
-        df['ATR'] = df['ATR'].interpolate().bfill()
-        if 'ATR_PCT' in df.columns:
-            df['ATR_PCT'] = df['ATR_PCT'].interpolate().bfill()
+        
+        # Check for NaN in critical indicators
+        latest_row = df.iloc[-1]
+        critical_indicators = ['RSI', 'ATR', 'ATR_PCT']
+        for indicator in critical_indicators:
+            if indicator in df.columns and pd.isna(latest_row[indicator]):
+                mark_exec_bad_ticker(symbol, "indicator_nan")
+                return None
 
         needed_cols = [c for c in ['RSI', 'ATR', 'ATR_PCT'] if c in df.columns]
         if df[needed_cols].dropna().shape[0] < 3:
-            logging.warning(f"{symbol}: Not enough valid RSI/ATR data even after interpolation. Skipping.")
+            logging.warning(f"{symbol}: Not enough valid RSI/ATR data. Skipping.")
             return None
 
         return df
@@ -1376,6 +1422,10 @@ TIER2_SIZE_MULT = 0.50        # half-size entries
 # NOTE: slightly widened to allow more tradable setups while still avoiding dead/chaotic regimes
 MIN_ATR_PCT = 0.002   # 0.2% of price
 MAX_ATR_PCT = 0.10    # 10% of price
+
+# Spread filtering
+MAX_SPREAD_PCT = 0.0015  # 0.15%
+MAX_SPREAD_ATR_FRACTION = 0.25
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
@@ -1887,39 +1937,23 @@ async def process_ticker(ticker):
         # ================ SMART EXIT LOGIC (if holding) ================
         # C) FIX EXIT LOGIC CONFLICTS WITH BRACKET ORDERS
         if have_position:
-            # When bracket orders are enabled, only run emergency and market close exits
+            # When bracket orders are enabled, only run ATR circuit breaker and market close exits
             if BRACKET_ORDERS_ENABLED:
-                # Calculate current PnL for emergency check
+                # Calculate current PnL
                 pnl_pct = 0.0
                 if entry_price > 0:
                     pnl_pct = (close_price - entry_price) / entry_price
                 
-                # 1) Emergency kill-switch: hard protective override
-                if pnl_pct <= -0.006:  # -0.6%
-                    pnl = close_position(ticker)
-                    SESSION.recently_traded[ticker] = ny_now()
-                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                    supabase_log(f"emergency_exit | {ticker} | pnl={pnl_pct:.2%}")
-                    return
-                
-                # Peak giveback exit (bracket orders enabled)
-                peak_key = f"{ticker}_peak_pnl"
-                prev_peak = SESSION.recently_traded.get(peak_key, 0.0)
-                new_peak = max(prev_peak, pnl_pct)
-                SESSION.recently_traded[peak_key] = new_peak
-                giveback = new_peak - pnl_pct
-                
-                if (new_peak >= 0.0040 and pnl_pct >= 0.0010 and
-                    ((0.0040 <= new_peak < 0.0080 and giveback >= 0.0015) or
-                     (0.0080 <= new_peak < 0.0150 and giveback >= 0.0025) or
-                     (0.0150 <= new_peak < 0.0300 and giveback >= 0.0040) or
-                     (new_peak >= 0.0300 and giveback >= 0.0060))):
-                    pnl = close_position(ticker)
-                    SESSION.recently_traded[ticker] = ny_now()
-                    SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
-                    supabase_log(f"peak_giveback_exit | {ticker} | peak={new_peak:.4%} pnl={pnl_pct:.4%} giveback={giveback:.4%}")
-                    SESSION.recently_traded[peak_key] = 0.0
-                    return
+                # ATR-based circuit breaker ONLY
+                atr_for_position = df['ATR'].iloc[-1]
+                if not pd.isna(atr_for_position) and entry_price > 0:
+                    atr_stop_pct = 2.2 * atr_for_position / entry_price
+                    if pnl_pct <= -atr_stop_pct:
+                        pnl = close_position(ticker)
+                        SESSION.recently_traded[ticker] = ny_now()
+                        SESSION.trade_history.setdefault(ticker, {})['last_sell'] = ny_now()
+                        supabase_log(f"atr_circuit_exit | {ticker} | atr_pct={atr_stop_pct:.4f}")
+                        return
                 
                 # 2) Market closeout logic will handle closing positions at market close
                 # (existing close_all_positions and closeout-window logic remains intact)
@@ -2053,6 +2087,37 @@ async def process_ticker(ticker):
             score=score
         ):
             return
+            
+        # === Continuation Gate - ALL conditions must be met for entry ===
+        if len(df) >= 4:  # Need at least 4 candles for proper analysis
+            # 1) Breakout confirmation: current close >= max of previous 3 highs
+            prev_3_highs = df['high'].iloc[-4:-1]  # Previous 3 fully closed candles
+            max_prev_high = prev_3_highs.max()
+            if close_price < max_prev_high:
+                logging.debug(f"[CONTINUATION GATE BLOCKED] {ticker} | reason=NO_BREAKOUT | close={close_price:.2f} < max_prev_high={max_prev_high:.2f}")
+                return
+            
+            # 2) Momentum persistence: at least 2 of last 3 candles must be green
+            prev_3_candles = df.iloc[-4:-1]  # Previous 3 fully closed candles
+            green_count = sum(1 for _, candle in prev_3_candles.iterrows() if candle['close'] > candle['open'])
+            if green_count < 2:
+                logging.debug(f"[CONTINUATION GATE BLOCKED] {ticker} | reason=WEAK_MOMENTUM | green_count={green_count}/3")
+                return
+            
+            # 3) Range expansion: current range >= 1.2 * avg range of last 5
+            if len(df) >= 5:
+                current_range = df['high'].iloc[-1] - df['low'].iloc[-1]
+                last_5_ranges = df.iloc[-6:-1].apply(lambda row: row['high'] - row['low'], axis=1)
+                avg_range_last_5 = last_5_ranges.mean()
+                if current_range < (1.2 * avg_range_last_5):
+                    logging.debug(f"[CONTINUATION GATE BLOCKED] {ticker} | reason=NO_RANGE_EXPANSION | current={current_range:.3f} < required={1.2 * avg_range_last_5:.3f}")
+                    return
+            
+            # 4) Not overextended: RSI <= 68
+            if not pd.isna(rsi) and rsi > 68:
+                logging.debug(f"[CONTINUATION GATE BLOCKED] {ticker} | reason=OVEREXTENDED | rsi={rsi:.1f} > 68")
+                return
+        
         # ================ ENTRY LOGIC (if flat) ================
         # Max concurrent positions safety guard
         if get_open_position_count() >= MAX_CONCURRENT_POSITIONS:
@@ -2089,6 +2154,12 @@ async def process_ticker(ticker):
         # Phase 1 Safety: Block new entries in last 30 minutes of market
         if is_last_30_minutes_of_market():
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LAST_30_MINUTES")
+            return
+        
+        # Spread filtering before entry
+        bid, ask, mid, spread_pct = get_latest_quote(ticker)
+        if spread_pct is None or spread_pct > MAX_SPREAD_PCT:
+            logging.debug(f"entry_blocked | {ticker} | reason=spread | spread_pct={spread_pct}")
             return
         
         # Conservative Entry Logic (Step 2)

@@ -1942,9 +1942,10 @@ async def process_ticker(ticker):
         
         # Keep existing logging for wide spreads (but don't block the trade)
         if not spread_is_acceptable(spread_pct, atr_pct) and not have_position:
+            # Spread is handled via size reduction, not hard veto
             reason_log(
-                f"spread_skip:{ticker}",
-                f"entry_blocked | {ticker} | reason=spread_too_wide | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
+                f"spread_soft:{ticker}",
+                f"spread_softened | {ticker} | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
                 min_seconds=300,
             )
 

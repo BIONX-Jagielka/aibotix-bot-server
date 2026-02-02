@@ -1442,7 +1442,7 @@ TIER2_SIZE_MULT = 0.50        # half-size entries
 
 # Volatility guard (ignore ultra-quiet or too-wild regimes)
 # NOTE: slightly widened to allow more tradable setups while still avoiding dead/chaotic regimes
-MIN_ATR_PCT = 0.0010   # allow calmer names (0.10%)
+MIN_ATR_PCT = 0.0006   # allow calmer names (0.06%)
 MAX_ATR_PCT = 0.12     # slightly wider top-end; extreme names still filtered elsewhere
 
 # Spread filtering (relaxed + adaptive)
@@ -1931,15 +1931,22 @@ async def process_ticker(ticker):
             )
             return
 
-        # Spread gate (adaptive): skip illiquid names (primary cause of 'no trades' days)
+        # Spread gate (adaptive): apply size modifier instead of hard block
         bid, ask, mid, spread_pct = get_latest_quote(ticker)
+        spread_size_mult = 1.0
+        if spread_pct is not None and atr_pct is not None:
+            if spread_pct > MAX_SPREAD_PCT:
+                spread_size_mult = 0.40
+            elif spread_pct > (MAX_SPREAD_ATR_FRACTION * atr_pct):
+                spread_size_mult = 0.60
+        
+        # Keep existing logging for wide spreads (but don't block the trade)
         if not spread_is_acceptable(spread_pct, atr_pct) and not have_position:
             reason_log(
                 f"spread_skip:{ticker}",
                 f"entry_blocked | {ticker} | reason=spread_too_wide | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
                 min_seconds=300,
             )
-            return
 
         # Cooldowns after recent actions
         now = ny_now()
@@ -2362,7 +2369,7 @@ async def process_ticker(ticker):
             qty2 *= 0.65  # Additional soft reduction
         
         # Step 4: Apply remaining size modifiers from entry quality assessment
-        final_mult = rsi_size_mult  # Keep RSI sizing
+        final_mult = rsi_size_mult * spread_size_mult  # Include spread sizing
         final_mult = max(0.25, min(final_mult, 1.0))  # Clamp between 25% and 100%
         
         # Final quantity

@@ -1277,6 +1277,13 @@ def calculate_position_size(symbol, risk_per_trade):
     
     max_risk = max(usable_equity * risk_per_trade, 0.01)  # ensure a tiny non-zero risk budget
 
+    # Risk-state sizing (keeps bot trading in DEGRADED instead of freezing it)
+    state = getattr(SESSION, "risk_state", "NORMAL")
+    if state == "DEGRADED":
+        max_risk *= 0.75   # reduced size, still trades
+    elif state == "HALT":
+        return 0.0
+
     df = fetch_data(symbol)
     if df is None or df.empty:
         return 0.0
@@ -1424,9 +1431,9 @@ INDICATOR_WEIGHTS = {
     'Sentiment': 0.2
 }
 # --- Signal thresholds & trade guards ---
-SIGNAL_BUY_THRESHOLD = 0.16   # how strong the combined signal must be to enter
-SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
-MICRO_PROFIT_TAKE = 0.0035   # 0.35% (was too small to beat friction)
+SIGNAL_BUY_THRESHOLD = 0.12      # was 0.16 (too strict → no trades)
+SIGNAL_SELL_THRESHOLD = -0.08    # was -0.10 (exit earlier on decay)
+MICRO_PROFIT_TAKE = 0.0040       # keep friction-aware, slightly higher than before
 
 # === Tiered Execution Thresholds ===
 TIER1_THRESHOLD_MULT = 1.00   # full confidence
@@ -1435,14 +1442,14 @@ TIER2_SIZE_MULT = 0.50        # half-size entries
 
 # Volatility guard (ignore ultra-quiet or too-wild regimes)
 # NOTE: slightly widened to allow more tradable setups while still avoiding dead/chaotic regimes
-MIN_ATR_PCT = 0.0015  # 0.15% of price (slightly wider so we can trade calmer regimes)
-MAX_ATR_PCT = 0.10    # 10% of price
+MIN_ATR_PCT = 0.0010   # allow calmer names (0.10%)
+MAX_ATR_PCT = 0.12     # slightly wider top-end; extreme names still filtered elsewhere
 
 # Spread filtering (relaxed + adaptive)
 # Many tickers (especially outside mega-caps) have spreads >0.15% even when tradable.
 # We cap spread by BOTH an absolute % and a fraction of ATR% so we don't enter illiquid names.
-MAX_SPREAD_PCT = 0.0030          # 0.30% absolute cap
-MAX_SPREAD_ATR_FRACTION = 0.30   # spread must be <= 30% of ATR% (adaptive)
+MAX_SPREAD_PCT = 0.0040            # 0.40% absolute cap
+MAX_SPREAD_ATR_FRACTION = 0.45     # allow spread up to 45% of ATR% (still adaptive)
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
@@ -1459,12 +1466,12 @@ MVT_ENABLED = True
 MVT_MIN_SCORE = 0.16                  # allow "good enough" setups when momentum/trend confirm
 MVT_RSI_MIN = 42
 MVT_RSI_MAX = 62
-MVT_MIN_ATR_PCT = 0.0020              # 0.20% ATR% minimum for MVT
+MVT_MIN_ATR_PCT = 0.0016              # 0.16% ATR% minimum for MVT
 MVT_MINUTES_AFTER_OPEN = 15           # don't MVT in the very first minutes
 FIRST_TRADE_BIAS_ENABLED = True
 FIRST_TRADE_BIAS_WINDOW_MIN = 60      # only applies for first entry within first hour
-FIRST_TRADE_SCORE_RELAX = 0.02        # reduce threshold by 0.02 for first trade only
-FIRST_TRADE_RSI_MAX = 70              # allow a slightly higher RSI for first trade only
+FIRST_TRADE_SCORE_RELAX = 0.03        # reduce threshold by 0.03 for first trade only
+FIRST_TRADE_RSI_MAX = 72              # allow a slightly higher RSI for first trade only
 
 # Position sizing caps
 MIN_DOLLARS_PER_TRADE = 0.0  # We allow very small fractional trades
@@ -1903,11 +1910,23 @@ async def process_ticker(ticker):
         pos_qty, entry_price = await get_position_async(ticker)
         have_position = pos_qty > 0
 
+        # Sentiment (placeholder currently returns 0)
+        sentiment = await get_sentiment_score(ticker)
+
+        # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
+        score = calculate_signal_score(
+            rsi=rsi, atr=atr_pct, sentiment=sentiment,
+            macd=macd, close_price=close_price,
+            bb_upper=bb_upper, bb_lower=bb_lower
+        )
+        if score is None:
+            return
+
         # Quick volatility guard
         if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
             reason_log(
                 f"atr_skip:{ticker}",
-                f"entry_blocked | {ticker} | reason=atr_out_of_range | atr_pct={atr_pct}",
+                f"entry_blocked | {ticker} | reason=atr_out_of_range | score={score} rsi={rsi} atr_pct={atr_pct}",
                 min_seconds=300,
             )
             return
@@ -1917,7 +1936,7 @@ async def process_ticker(ticker):
         if not spread_is_acceptable(spread_pct, atr_pct) and not have_position:
             reason_log(
                 f"spread_skip:{ticker}",
-                f"entry_blocked | {ticker} | reason=spread_too_wide | spread_pct={spread_pct} atr_pct={atr_pct}",
+                f"entry_blocked | {ticker} | reason=spread_too_wide | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
                 min_seconds=300,
             )
             return
@@ -1932,13 +1951,14 @@ async def process_ticker(ticker):
                 logging.info(f"Skipping {ticker}: re-entry cooldown ({int(REENTRY_COOLDOWN - elapsed)}s left).")
                 return
 
-        # Sentiment (placeholder currently returns 0)
-        sentiment = await get_sentiment_score(ticker)
-
         # Partial entry constants
         PARTIAL_ENTRY_ENABLED = True
-        PARTIAL_ENTRY_SCORE_FLOOR = 0.14      # minimum score to allow partial entry
-        PARTIAL_ENTRY_MULTIPLIER = 0.25       # 25% of normal size
+        PARTIAL_ENTRY_SCORE_FLOOR = 0.10     # was 0.14 (too strict)
+        PARTIAL_ENTRY_MULTIPLIER = 0.35      # was 0.25 (too tiny to matter)
+
+        # If signal is decent but not perfect, allow a small starter position.
+        # This increases trade frequency without removing safety gates.
+        partial_entry_allowed = (not have_position) and (score is not None) and (score >= PARTIAL_ENTRY_SCORE_FLOOR)
 
         # Detect market regime for adaptive strategy
         regime = detect_market_regime(df)
@@ -1950,27 +1970,13 @@ async def process_ticker(ticker):
         # - Only hard block ultra-low volatility (extreme dead market)
         squeeze_size_mult = 1.0
         if regime == "SQUEEZE" and not have_position:
-            if pd.isna(atr_pct) or atr_pct < 0.0012:
+            if pd.isna(atr_pct) or atr_pct < 0.0009:
                 logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_DEAD_MARKET atr%={atr_pct:.4f}")
-                reason_log(f"squeeze_dead:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_dead_market | atr_pct={atr_pct:.4f}")
+                reason_log(f"squeeze_dead:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_dead_market | score={score} rsi={rsi} atr_pct={atr_pct}")
                 return
             else:
                 squeeze_size_mult = 0.35  # Reduced size for SQUEEZE regime
                 logging.debug(f"[SQUEEZE SIZE REDUCTION] {ticker} | regime={regime} atr%={atr_pct:.4f} mult={squeeze_size_mult}")
-
-        # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
-        score = calculate_signal_score(
-            rsi=rsi, atr=atr_pct, sentiment=sentiment,
-            macd=macd, close_price=close_price,
-            bb_upper=bb_upper, bb_lower=bb_lower
-        )
-        if score is None:
-            reason_log(
-                f"score_none:{ticker}",
-                f"entry_blocked | {ticker} | reason=score_none",
-                min_seconds=300,
-            )
-            return
 
         # ================ SMART EXIT LOGIC (if holding) ================
         # C) FIX EXIT LOGIC CONFLICTS WITH BRACKET ORDERS
@@ -2291,37 +2297,31 @@ async def process_ticker(ticker):
             ):
                 mvt_ok = (score >= MVT_MIN_SCORE)
 
-        # --- Tiered Entry Decision ---
-        tier = None
-        partial_entry_mult = 1.0
+        # --- Entry decision ladder (full vs partial) ---
+        entry_threshold = SIGNAL_BUY_THRESHOLD
+        try:
+            if FIRST_TRADE_BIAS_ENABLED and not SESSION.first_trade_done and SESSION.market_open_ts is not None:
+                minutes_since_open = (ny_now() - SESSION.market_open_ts).total_seconds() / 60.0
+                if minutes_since_open <= FIRST_TRADE_BIAS_WINDOW_MIN:
+                    entry_threshold = max(SIGNAL_BUY_THRESHOLD - FIRST_TRADE_SCORE_RELAX, 0.0)
+        except Exception:
+            pass
 
-        if score >= threshold * TIER1_THRESHOLD_MULT:
-            tier = "TIER1"
-        elif score >= threshold * TIER2_THRESHOLD_MULT:
-            tier = "TIER2"
-        elif mvt_ok:
-            tier = "MVT"
-        elif (
-            PARTIAL_ENTRY_ENABLED
-            and score >= PARTIAL_ENTRY_SCORE_FLOOR
-            and score < threshold * TIER2_THRESHOLD_MULT
-        ):
-            tier = "PARTIAL"
-            partial_entry_mult = PARTIAL_ENTRY_MULTIPLIER
-        elif score >= (SIGNAL_BUY_THRESHOLD - 0.02):  # Marginal signal score
-            tier = "MARGINAL"
-            partial_entry_mult = 0.25  # 25% size for marginal scores
-        else:
-            if score >= threshold * 0.85:
+        entry_mode = None  # "full" or "partial"
+        if score is not None and score >= entry_threshold:
+            entry_mode = "full"
+        elif PARTIAL_ENTRY_ENABLED and score is not None and score >= PARTIAL_ENTRY_SCORE_FLOOR:
+            entry_mode = "partial"
+
+        # Only proceed if we have a valid entry mode and no position
+        if entry_mode is None or have_position:
+            if entry_mode is None:
                 reason_log(
-                    f"near_miss:{ticker}",
-                    f"entry_blocked | {ticker} | reason=near_miss | score={score:.3f} threshold={threshold:.3f}"
+                    f"score_low:{ticker}",
+                    f"entry_blocked | {ticker} | reason=score_too_low | score={score} threshold={entry_threshold} partial_floor={PARTIAL_ENTRY_SCORE_FLOOR}",
+                    min_seconds=300,
                 )
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LOW_SCORE score={score:.3f} threshold={threshold:.3f} base={base_threshold:.3f} mvt_ok={mvt_ok}")
             return
-
-        if tier == "MVT" and score < threshold:
-            logging.info(f"[ENTRY ALLOWED:MVT] {ticker} | score={score:.3f} (min={MVT_MIN_SCORE:.3f}) rsi={rsi:.1f} atr%={atr_pct:.3%} macd_rising={momentum_confirmed} mins_since_open={minutes_since_open:.0f}")
 
         # 7. Trend acceleration – confirm short‑term momentum (allow flat)
         if not trend_confirmed:
@@ -2335,7 +2335,7 @@ async def process_ticker(ticker):
         if should_halt_trading():
             return
 
-        # D) MAKE POSITION SIZING CONSISTENT WITH QUALITY SCORE + HISTORICAL HINT MULTIPLIER
+        # D) MAKE POSITION SIZING CONSISTENT WITH ENTRY MODE + EXISTING MULTIPLIERS
         base_qty = calculate_position_size(ticker, RISK_PER_TRADE)
         
         # Apply risk state scaling first
@@ -2343,6 +2343,13 @@ async def process_ticker(ticker):
             base_qty *= 0.5  # 50% reduction in DEGRADED state
         elif SESSION.risk_state == "HALT":
             return  # No new positions in HALT state
+
+        # Apply entry mode sizing
+        if entry_mode == "partial":
+            base_qty *= PARTIAL_ENTRY_MULTIPLIER
+        
+        # Apply squeeze sizing (from existing logic)
+        base_qty *= squeeze_size_mult
 
         # Step 1: Scale by score
         qty1 = scale_qty_by_score(base_qty, score)
@@ -2354,8 +2361,8 @@ async def process_ticker(ticker):
         if SESSION.risk_state == "DEGRADED":
             qty2 *= 0.65  # Additional soft reduction
         
-        # Step 4: Apply size modifiers from entry quality assessment
-        final_mult = squeeze_size_mult * rsi_size_mult * partial_entry_mult
+        # Step 4: Apply remaining size modifiers from entry quality assessment
+        final_mult = rsi_size_mult  # Keep RSI sizing
         final_mult = max(0.25, min(final_mult, 1.0))  # Clamp between 25% and 100%
         
         # Final quantity
@@ -2369,7 +2376,13 @@ async def process_ticker(ticker):
                 min_seconds=600  # 10 minutes
             )
 
-        if qty <= 0:
+        # 3) Add explicit qty_zero rejection logging
+        if qty is None or qty <= 0:
+            reason_log(
+                f"qty_zero:{ticker}",
+                f"entry_blocked | {ticker} | reason=qty_zero | mode={entry_mode} | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
+                min_seconds=180,
+            )
             return
         
         # Phase 1 Safety: Buying power guard
@@ -2384,20 +2397,15 @@ async def process_ticker(ticker):
             # )
             return
 
-        # Entry log with tier transparency
-        if tier == "PARTIAL":
-            logging.info(
-                f"ENTRY {ticker} [PARTIAL] | score={score:.3f} threshold={threshold:.3f} qty={qty:.4f}"
-            )
-        
+        # Entry log with mode transparency
         logging.info(
-            f"ENTRY {ticker} [{tier}] | px={close_price:.2f} qty={qty:.4f} "
-            f"score={score:.3f} thr={threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} "
+            f"ENTRY {ticker} [{entry_mode.upper()}] | px={close_price:.2f} qty={qty:.4f} "
+            f"score={score:.3f} thr={entry_threshold:.3f} rsi={rsi:.1f} atr%={atr_pct:.3%} "
             f"macd_rising={momentum_confirmed} regime={regime}"
         )
         # Trade intent transparency log
         supabase_log(
-            f"trade_signal | BUY {ticker} | tier={tier} score={score:.2f} regime={regime}"
+            f"trade_signal | BUY {ticker} | mode={entry_mode} score={score:.2f} regime={regime}"
         )
         ui_event(f"Signal found: BUY setup for {ticker}. Attempting entry…")
 

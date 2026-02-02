@@ -347,6 +347,13 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
 
         # Now process valid dataframe
         latest = df.iloc[-1]
+        
+        # 1) ATR% PRE-FILTER (HIGH PRIORITY): Filter out symbols outside bot's acceptable range
+        atr_pct = latest['atr'] / latest['close'] if latest['close'] > 0 else 0
+        if atr_pct < 0.002 or atr_pct > 0.08:
+            skipped_invalid_count += 1
+            continue
+        
         logging.info(f"{symbol} - RSI: {latest['rsi']:.2f}, ATR: {latest['atr']:.4f}, EMA crossover: {latest['ema_crossover']}")
         
         # 1) Market Regime Classification (internal only)
@@ -538,6 +545,7 @@ def enhanced_unified_ai_score(
     regime: str = "transition",
     atr_expansion_bias: float = 0.0,
     candle_structure_bias: float = 0.0,
+    df: Optional[pd.DataFrame] = None,
 ) -> Optional[float]:
     """
     Enhanced unified multi-factor score with market context awareness.
@@ -558,18 +566,59 @@ def enhanced_unified_ai_score(
         gap = 0.0
 
     score = 0.0
+    
+    # 2) SPREAD-AWARE PRIORITIZATION (SOFT PENALTY)
+    # Note: In a real implementation, you'd get bid/ask from quote data
+    # For now, we'll use a proxy based on volatility and volume
+    spread_penalty = 0.0
+    if df is not None and len(df) > 0:
+        # Estimate spread impact using volatility proxy
+        latest = df.iloc[-1]
+        estimated_spread = atr / latest['close'] * 0.5 if latest['close'] > 0 else 0
+        if estimated_spread > 0.0020:
+            spread_penalty = min(0.3, (estimated_spread - 0.0020) * 50)  # Linear penalty
+    
+    # 3) RSI PREFERENCE WEIGHTING
+    rsi_bias = 0.0
+    if 45 <= rsi <= 65:
+        rsi_bias = 0.3  # Strong positive bias for sweet spot
+    elif 30 <= rsi <= 75:
+        rsi_bias = 0.1  # Neutral bias for acceptable range
+    elif rsi < 25 or rsi > 75:
+        rsi_bias = -0.4  # Penalty for extreme RSI
+    
+    # 4) LIGHT PRICE STRUCTURE BIAS
+    structure_bias = 0.0
+    if df is not None and len(df) >= 10:
+        recent_highs = df['high'].tail(10)
+        current_close = df['close'].iloc[-1]
+        max_recent_high = recent_highs.max()
+        
+        # Favor symbols near recent highs (within 2-3%)
+        if max_recent_high > 0:
+            distance_from_high = (max_recent_high - current_close) / max_recent_high
+            if distance_from_high <= 0.03:  # Within 3% of recent high
+                structure_bias += 0.15
+        
+        # Favor expanding ranges (stable/rising ATR)
+        if len(df) >= 20:
+            recent_atr = df.tail(10)['high'] - df.tail(10)['low']  # Recent ranges
+            older_atr = df.tail(20).head(10)['high'] - df.tail(20).head(10)['low']  # Older ranges
+            if recent_atr.mean() >= older_atr.mean() * 0.95:  # Stable or expanding
+                structure_bias += 0.1
 
-    # 3) RSI Context Reinterpretation (bias only, not entry signal)
+    # Original RSI Context Reinterpretation (modified with new bias)
+    base_rsi_score = 0.0
     if 40 <= rsi <= 60:
-        score += 0.1  # slight penalty for neutral RSI
+        base_rsi_score += 0.1  # slight penalty for neutral RSI
     elif rsi > 60 and regime == "trend":
-        score += 0.4  # positive bias for momentum in trend
+        base_rsi_score += 0.4  # positive bias for momentum in trend
     elif rsi < 40 and regime == "trend":
-        score -= 0.2  # negative bias for weakness in trend
+        base_rsi_score -= 0.2  # negative bias for weakness in trend
     elif 25 <= rsi <= 80:
-        score += 0.2  # acceptable range bonus
+        base_rsi_score += 0.2  # acceptable range bonus
     else:
-        score -= 0.5  # penalty for extreme RSI
+        base_rsi_score -= 0.5  # penalty for extreme RSI
 
     # 2) ATR: prefer reasonable volatility with regime context
     atr_clamped = min(max(atr, 0.01), 5.0)
@@ -597,15 +646,42 @@ def enhanced_unified_ai_score(
         score += slope_score
 
     # 6) Gap: very large gaps are risky; small gaps can be constructive
+    gap_score = 0.0
     if abs(gap) > 0.10:
-        score -= 1.0
-    elif abs(gap) > 0.02:
-        score += 0.2
+        gap_score = -1.0  # large gap penalty
+    elif 0.01 <= abs(gap) <= 0.03:
+        gap_score = 0.3  # small gap bonus
+    
+    # Combine all scoring components
+    score = (
+        base_rsi_score + rsi_bias +  # RSI components (original + preference weighting)
+        base_atr_score +             # ATR preference for moderate volatility
+        gap_score +                  # Gap analysis
+        atr_expansion_bias +         # Volatility expansion bias
+        candle_structure_bias +      # Candle structure awareness
+        structure_bias -             # Price structure bias (NEW)
+        spread_penalty               # Spread penalty (NEW)
+    )
+    
+    # Add remaining original components
+    if ema_crossover:
+        crossover_bonus = 0.5
+        if regime == "trend":
+            crossover_bonus *= 1.2  # stronger bonus in trend regime
+        score += crossover_bonus
 
-    # Apply new bias factors
-    score += atr_expansion_bias + candle_structure_bias
+    # Volume ratio: prefer above-average volume, cap contribution
+    if volume_ratio > 1.0:
+        score += min(1.5, (volume_ratio - 1.0) / 2.0)
 
-    return score
+    # Slope: upward trend is good, context-aware
+    if slope > 0:
+        slope_score = min(1.5, slope * 100.0)
+        if regime == "range":
+            slope_score *= 0.7  # reduce slope importance in range-bound markets
+        score += slope_score
+
+    return max(score, 0.0)  # Ensure non-negative score
 
 def unified_ai_score(
     rsi: float,

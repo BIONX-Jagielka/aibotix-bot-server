@@ -1119,6 +1119,21 @@ def get_latest_quote(symbol):
         logging.warning(f"Quote fetch failed for {symbol}: {e}")
         return (None, None, None, None)
 
+def spread_is_acceptable(spread_pct: float | None, atr_pct: float | None) -> bool:
+    """Adaptive spread gate: requires spread <= absolute cap AND <= fraction of ATR%."""
+    try:
+        if spread_pct is None:
+            return True  # if we can't compute spread, don't block; other gates still apply
+        if spread_pct <= 0:
+            return True
+        if spread_pct > MAX_SPREAD_PCT:
+            return False
+        if atr_pct is None or atr_pct <= 0:
+            return spread_pct <= MAX_SPREAD_PCT
+        return spread_pct <= (MAX_SPREAD_ATR_FRACTION * atr_pct)
+    except Exception:
+        return True
+
 # === Smart Ticker Recovery Lock structures and helpers ===
 class TickerRecoveryState:
     def __init__(self):
@@ -1409,9 +1424,9 @@ INDICATOR_WEIGHTS = {
     'Sentiment': 0.2
 }
 # --- Signal thresholds & trade guards ---
-SIGNAL_BUY_THRESHOLD = 0.17   # how strong the combined signal must be to enter
+SIGNAL_BUY_THRESHOLD = 0.16   # how strong the combined signal must be to enter
 SIGNAL_SELL_THRESHOLD = -0.10 # if score flips negative enough while holding, exit
-MICRO_PROFIT_TAKE = 0.002   # 0.10% fast profit snap exit
+MICRO_PROFIT_TAKE = 0.0035   # 0.35% (was too small to beat friction)
 
 # === Tiered Execution Thresholds ===
 TIER1_THRESHOLD_MULT = 1.00   # full confidence
@@ -1420,12 +1435,14 @@ TIER2_SIZE_MULT = 0.50        # half-size entries
 
 # Volatility guard (ignore ultra-quiet or too-wild regimes)
 # NOTE: slightly widened to allow more tradable setups while still avoiding dead/chaotic regimes
-MIN_ATR_PCT = 0.002   # 0.2% of price
+MIN_ATR_PCT = 0.0015  # 0.15% of price (slightly wider so we can trade calmer regimes)
 MAX_ATR_PCT = 0.10    # 10% of price
 
-# Spread filtering
-MAX_SPREAD_PCT = 0.0015  # 0.15%
-MAX_SPREAD_ATR_FRACTION = 0.25
+# Spread filtering (relaxed + adaptive)
+# Many tickers (especially outside mega-caps) have spreads >0.15% even when tradable.
+# We cap spread by BOTH an absolute % and a fraction of ATR% so we don't enter illiquid names.
+MAX_SPREAD_PCT = 0.0030          # 0.30% absolute cap
+MAX_SPREAD_ATR_FRACTION = 0.30   # spread must be <= 30% of ATR% (adaptive)
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
@@ -1434,8 +1451,8 @@ MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
 EXEC_BAD_TICKER_COOLDOWN_MIN = 45   # minutes to ignore tickers with bad/insufficient data
 
 # --- Active ticker rotation constants ---
-AI_REFRESH_SECONDS = 900   # 15 minutes (not 30)
-MIN_ACTIVE_TICKERS = 20    # ensure we keep a broad universe
+AI_REFRESH_SECONDS = 600   # 10 minutes (more responsive during the session)
+MIN_ACTIVE_TICKERS = 25    # keep a broader universe
 
 # === Trade activity tuning (safe) ===
 MVT_ENABLED = True
@@ -1756,7 +1773,7 @@ async def trade_loop_async(allowed_tickers=None):
                     try:
                         fresh_ai_tickers = await asyncio.to_thread(
                             get_top_tickers,
-                            15,  # Get 15 tickers from AI
+                            30,  # Get 30 tickers from AI
                             SESSION.USER_ID,
                             SESSION.CURRENT_MODE
                         )
@@ -1785,7 +1802,7 @@ async def trade_loop_async(allowed_tickers=None):
                     SESSION.rotation_index = 0
                 
                 # Select subset for this round (spread attention)
-                batch_size = min(8, len(all_candidate_tickers))
+                batch_size = min(12, len(all_candidate_tickers))
                 start_idx = SESSION.rotation_index % len(all_candidate_tickers)
                 
                 tickers_to_evaluate = []
@@ -1809,7 +1826,7 @@ async def trade_loop_async(allowed_tickers=None):
                             # Stale evaluation guard (spread attention, avoid spam)
                             if ticker in SESSION.last_ticker_eval:
                                 last_eval = SESSION.last_ticker_eval[ticker]
-                                if (now - last_eval).total_seconds() < 60:
+                                if (now - last_eval).total_seconds() < 30:
                                     return None
                             
                             SESSION.last_ticker_eval[ticker] = now
@@ -1882,13 +1899,28 @@ async def process_ticker(ticker):
         bb_lower = float(df['BB_lower'].iloc[-1]) if 'BB_lower' in df else np.nan
         atr_pct = float(df['ATR_PCT'].iloc[-1]) if 'ATR_PCT' in df else (atr / close_price if close_price else np.nan)
 
-        # Quick volatility guard
-        if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
-            return
-
         # Position info
         pos_qty, entry_price = await get_position_async(ticker)
         have_position = pos_qty > 0
+
+        # Quick volatility guard
+        if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+            reason_log(
+                f"atr_skip:{ticker}",
+                f"entry_blocked | {ticker} | reason=atr_out_of_range | atr_pct={atr_pct}",
+                min_seconds=300,
+            )
+            return
+
+        # Spread gate (adaptive): skip illiquid names (primary cause of 'no trades' days)
+        bid, ask, mid, spread_pct = get_latest_quote(ticker)
+        if not spread_is_acceptable(spread_pct, atr_pct) and not have_position:
+            reason_log(
+                f"spread_skip:{ticker}",
+                f"entry_blocked | {ticker} | reason=spread_too_wide | spread_pct={spread_pct} atr_pct={atr_pct}",
+                min_seconds=300,
+            )
+            return
 
         # Cooldowns after recent actions
         now = ny_now()
@@ -1912,18 +1944,19 @@ async def process_ticker(ticker):
         regime = detect_market_regime(df)
         logging.debug(f"[REGIME] {ticker} | regime={regime}")
         
-        # Phase 1 Safety: SQUEEZE handling (soft)
+        # Phase 1 Safety: SQUEEZE handling (soft sizing)
         # Instead of a hard ban (which can cause zero trades for long periods), we:
-        # - Only block ultra-low volatility squeezes
-        # - Otherwise allow entries but reduce position size later
-        squeeze_soft_block = False
+        # - Apply size reduction for SQUEEZE regimes
+        # - Only hard block ultra-low volatility (extreme dead market)
+        squeeze_size_mult = 1.0
         if regime == "SQUEEZE" and not have_position:
-            if pd.isna(atr_pct) or atr_pct < 0.0025:
-                squeeze_soft_block = True
-                logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_TOO_QUIET atr%={atr_pct:.4f}")
-                reason_log(f"squeeze_quiet:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_too_quiet | atr_pct={atr_pct:.4f}")
-                # ui_log(f"entry_block_{ticker}", f"{ticker}: Entry blocked — volatility too quiet for safe trading.")
+            if pd.isna(atr_pct) or atr_pct < 0.0012:
+                logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_DEAD_MARKET atr%={atr_pct:.4f}")
+                reason_log(f"squeeze_dead:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_dead_market | atr_pct={atr_pct:.4f}")
                 return
+            else:
+                squeeze_size_mult = 0.35  # Reduced size for SQUEEZE regime
+                logging.debug(f"[SQUEEZE SIZE REDUCTION] {ticker} | regime={regime} atr%={atr_pct:.4f} mult={squeeze_size_mult}")
 
         # Compute signal score (uses RSI/ATR/sentiment + small MACD/BB blend)
         score = calculate_signal_score(
@@ -1932,6 +1965,11 @@ async def process_ticker(ticker):
             bb_upper=bb_upper, bb_lower=bb_lower
         )
         if score is None:
+            reason_log(
+                f"score_none:{ticker}",
+                f"entry_blocked | {ticker} | reason=score_none",
+                min_seconds=300,
+            )
             return
 
         # ================ SMART EXIT LOGIC (if holding) ================
@@ -1960,10 +1998,11 @@ async def process_ticker(ticker):
                 
             else:
                 # E) OVERTRADING CONTROL: Check minimum hold time for discretionary exits
+                MIN_HOLD_SECONDS = 300  # 5 minutes
                 opened_at = SESSION.trade_history.get(ticker, {}).get('opened_at')
                 if opened_at:
                     hold_time_seconds = (ny_now() - opened_at).total_seconds()
-                    if hold_time_seconds < 120:  # 2 minutes minimum hold
+                    if hold_time_seconds < MIN_HOLD_SECONDS:  # 5 minutes minimum hold
                         # Allow emergency exits but skip discretionary ones
                         pnl_pct = (close_price - entry_price) / entry_price if entry_price > 0 else 0.0
                         if pnl_pct > -0.006:  # Not an emergency
@@ -2156,16 +2195,12 @@ async def process_ticker(ticker):
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=LAST_30_MINUTES")
             return
         
-        # Spread filtering before entry
-        bid, ask, mid, spread_pct = get_latest_quote(ticker)
-        if spread_pct is None or spread_pct > MAX_SPREAD_PCT:
-            logging.debug(f"entry_blocked | {ticker} | reason=spread | spread_pct={spread_pct}")
-            return
-        
         # Conservative Entry Logic (Step 2)
+        rsi_size_mult = 1.0  # Initialize RSI size multiplier
 
         # 1. RSI filter (base, with optional first-trade bias)
         rsi_max_allowed = 68
+        rsi_size_mult = 1.0
         # First-trade-of-day bias: only relax RSI max for the very first entry after open, within window
         minutes_since_open = None
         if SESSION.market_open_ts:
@@ -2178,8 +2213,12 @@ async def process_ticker(ticker):
             rsi_max_allowed = FIRST_TRADE_RSI_MAX
 
         if not pd.isna(rsi) and rsi > rsi_max_allowed:
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=RSI_TOO_HIGH rsi={rsi:.1f} max={rsi_max_allowed}")
-            return
+            if rsi > MAX_RSI_FOR_ENTRY:
+                rsi_size_mult = 0.60  # Reduced size for high RSI
+                logging.debug(f"[RSI SIZE REDUCTION] {ticker} | rsi={rsi:.1f} max_allowed={rsi_max_allowed} mult={rsi_size_mult}")
+            else:
+                logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=RSI_TOO_HIGH rsi={rsi:.1f} max={rsi_max_allowed}")
+                return
 
         # 2. ATR volatility filter (avoid weak or explosive regimes)
         if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
@@ -2254,6 +2293,7 @@ async def process_ticker(ticker):
 
         # --- Tiered Entry Decision ---
         tier = None
+        partial_entry_mult = 1.0
 
         if score >= threshold * TIER1_THRESHOLD_MULT:
             tier = "TIER1"
@@ -2267,6 +2307,10 @@ async def process_ticker(ticker):
             and score < threshold * TIER2_THRESHOLD_MULT
         ):
             tier = "PARTIAL"
+            partial_entry_mult = PARTIAL_ENTRY_MULTIPLIER
+        elif score >= (SIGNAL_BUY_THRESHOLD - 0.02):  # Marginal signal score
+            tier = "MARGINAL"
+            partial_entry_mult = 0.25  # 25% size for marginal scores
         else:
             if score >= threshold * 0.85:
                 reason_log(
@@ -2310,8 +2354,12 @@ async def process_ticker(ticker):
         if SESSION.risk_state == "DEGRADED":
             qty2 *= 0.65  # Additional soft reduction
         
+        # Step 4: Apply size modifiers from entry quality assessment
+        final_mult = squeeze_size_mult * rsi_size_mult * partial_entry_mult
+        final_mult = max(0.25, min(final_mult, 1.0))  # Clamp between 25% and 100%
+        
         # Final quantity
-        qty = qty2
+        qty = qty2 * final_mult
         
         # Throttled logging for hint application
         if hist_hint is not None and hist_mult != 1.0:

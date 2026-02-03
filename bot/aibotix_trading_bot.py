@@ -1,4 +1,6 @@
-# --- BotSession container for state (Patch B foundation) ---
+from __future__ import annotations
+
+from profit_lock_engine import ProfitLockState
 # --- BotSession container for state (Patch B foundation) ---
 
 # Global client registry for equity snapshots
@@ -58,6 +60,9 @@ class BotSession:
         self.risk_state = "NORMAL"  # NORMAL | DEGRADED | HALT
         self.last_risk_state_log = None
         self.per_ticker_loss_cooldown = {}  # ticker -> datetime until which ticker is cooled
+        
+        # Profit lock engine states
+        self.profit_lock_states: dict[str, ProfitLockState] = {}
 
 # Multi-user session registry: one BotSession per (user_id, mode)
 SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
@@ -94,6 +99,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.common.exceptions import APIError
+from profit_lock_engine import profit_lock_step
 import pandas as pd
 import time
 import datetime
@@ -1088,6 +1094,40 @@ def close_position(symbol):
         logging.error(f"Failed to close {symbol}: {e}")
         return None
 
+def cancel_replace_stop_for_symbol(alpaca_client, symbol: str, qty: float, stop_price: float, existing_order_id: str | None):
+    """
+    Cancel previous stop (if provided), then place a new stop-market sell for 'qty' at 'stop_price'.
+    Returns: new_order_id (or None if placement failed).
+    """
+    # Cancel old stop if exists
+    if existing_order_id:
+        try:
+            alpaca_client.cancel_order_by_id(existing_order_id)
+        except Exception:
+            # ignore cancel failures (order may be filled/cancelled)
+            pass
+
+    # Place new stop-market sell
+    try:
+        order = alpaca_client.submit_order(
+            symbol=symbol,
+            qty=str(qty),
+            side="sell",
+            type="stop",
+            time_in_force="gtc",
+            stop_price=str(stop_price),
+        )
+        return getattr(order, "id", None)
+    except Exception:
+        return None
+
+def close_position_market(alpaca_client, symbol: str):
+    try:
+        alpaca_client.close_position(symbol)
+        return True
+    except Exception:
+        return False
+
 def get_latest_quote(symbol):
     """
     Returns (bid, ask, mid, spread_pct).
@@ -1472,6 +1512,11 @@ FIRST_TRADE_BIAS_ENABLED = True
 FIRST_TRADE_BIAS_WINDOW_MIN = 60      # only applies for first entry within first hour
 FIRST_TRADE_SCORE_RELAX = 0.03        # reduce threshold by 0.03 for first trade only
 FIRST_TRADE_RSI_MAX = 72              # allow a slightly higher RSI for first trade only
+
+# Profit lock engine constants
+PROFIT_LOCK_COSTS_PCT = 0.0008
+PROFIT_LOCK_MIN_STEP_PCT = 0.0005
+PROFIT_LOCK_COOLDOWN_SEC = 20
 
 # Position sizing caps
 MIN_DOLLARS_PER_TRADE = 0.0  # We allow very small fractional trades
@@ -1910,6 +1955,10 @@ async def process_ticker(ticker):
         pos_qty, entry_price = await get_position_async(ticker)
         have_position = pos_qty > 0
 
+        # Clean up stale profit lock states for positions that no longer exist
+        if ticker in SESSION.profit_lock_states and not have_position:
+            del SESSION.profit_lock_states[ticker]
+
         # Sentiment (placeholder currently returns 0)
         sentiment = await get_sentiment_score(ticker)
 
@@ -1989,6 +2038,64 @@ async def process_ticker(ticker):
         # ================ SMART EXIT LOGIC (if holding) ================
         # C) FIX EXIT LOGIC CONFLICTS WITH BRACKET ORDERS
         if have_position:
+            # STEP 3-5: Profit lock engine integration
+            if pos_qty > 0 and entry_price > 0 and close_price > 0:
+                # Create/update profit lock state
+                st = SESSION.profit_lock_states.get(ticker)
+                if st is None:
+                    st = ProfitLockState(
+                        symbol=ticker,
+                        side="long",
+                        entry_price=float(entry_price),
+                        qty=float(pos_qty),
+                    )
+                    SESSION.profit_lock_states[ticker] = st
+                else:
+                    # Keep peak/locks, but refresh qty/entry if broker reports change
+                    st.qty = float(pos_qty)
+                    st.entry_price = float(entry_price)
+                
+                # STEP 4: Compute current unrealized PCT
+                current_price = float(close_price)
+                unrealized_pct = (current_price - st.entry_price) / st.entry_price
+                
+                # STEP 5: Call profit lock engine
+                should_update, new_stop_price, force_exit, reason = profit_lock_step(
+                    st,
+                    current_price=current_price,
+                    unrealized_pct=unrealized_pct,
+                    costs_pct=PROFIT_LOCK_COSTS_PCT,
+                    min_stop_step_pct=PROFIT_LOCK_MIN_STEP_PCT,
+                    update_cooldown_sec=PROFIT_LOCK_COOLDOWN_SEC,
+                )
+                
+                # Log only when action happens
+                if should_update or force_exit:
+                    logging.info(
+                        f"PROFIT_LOCK {ticker} | px={current_price:.4f} unreal={unrealized_pct:.4%} | {reason}"
+                    )
+                
+                # STEP 7: Wire stop updates
+                if should_update:
+                    new_id = cancel_replace_stop_for_symbol(
+                        alpaca_client=SESSION.api,
+                        symbol=st.symbol,
+                        qty=st.qty,
+                        stop_price=new_stop_price,
+                        existing_order_id=st.order_id_stop,
+                    )
+                    if new_id:
+                        st.order_id_stop = new_id
+                    else:
+                        logging.info(f"STOP_UPDATE_FAILED {ticker} stop={new_stop_price:.6f}")
+                
+                # STEP 8: Force exit on lock violation
+                if force_exit:
+                    success = close_position_market(SESSION.api, ticker)
+                    logging.info(f"LOCK_VIOLATION_EXIT {ticker} success={success} | {reason}")
+                    # Don't delete state yet - let stale cleanup handle it
+            
+            # Existing exit logic continues below
             # When bracket orders are enabled, only run ATR circuit breaker and market close exits
             if BRACKET_ORDERS_ENABLED:
                 # Calculate current PnL

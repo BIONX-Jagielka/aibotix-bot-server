@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Tuple
+from datetime import datetime, timedelta
 import time
 
 
@@ -38,6 +39,10 @@ class ProfitLockState:
 
     # Optional: track age of position if needed by caller
     opened_ts: float = field(default_factory=lambda: time.time())
+    
+    # TTL tracking for memory cleanup
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_updated: datetime = field(default_factory=datetime.utcnow)
 
 
 # Ladder rules:
@@ -51,6 +56,9 @@ LOCK_LADDER = [
     (0.0200, "trail_0p0060"),           # +2.00% peak -> lock at peak - 0.60%
     (0.0300, "trail_0p0045"),           # +3.00% peak -> lock at peak - 0.45%
 ]
+
+# TTL Configuration
+PROFIT_LOCK_STATE_TTL_DAYS = 7
 
 
 def _parse_trail_gap(rule: str) -> float:
@@ -88,6 +96,7 @@ def profit_lock_step(
         if unrealized_pct > state.peak_unrealized_pct:
             state.peak_unrealized_pct = unrealized_pct
         state.last_peak_update_ts = now
+        state.last_updated = datetime.utcnow()  # Update timestamp
 
     peak_pct = state.peak_unrealized_pct
 
@@ -127,6 +136,7 @@ def profit_lock_step(
             state.stop_price = desired_stop
             state.locked_min_profit_pct = desired_locked_pct
             state.last_stop_update_ts = now
+            state.last_updated = datetime.utcnow()  # Update timestamp
             state.last_decision = (
                 f"STOP_RATCHET stop={state.stop_price:.6f} lock={state.locked_min_profit_pct:.4%} phase={state.phase.value}"
             )
@@ -142,3 +152,15 @@ def profit_lock_step(
     # 7) No action
     state.last_decision = "NO_CHANGE"
     return False, state.stop_price, False, state.last_decision
+
+
+def cleanup_old_profit_lock_states(states: dict[str, ProfitLockState]) -> int:
+    """
+    Remove profit lock states older than TTL.
+    Returns: number of states cleaned.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=PROFIT_LOCK_STATE_TTL_DAYS)
+    stale = [sym for sym, st in states.items() if st.last_updated < cutoff]
+    for sym in stale:
+        del states[sym]
+    return len(stale)

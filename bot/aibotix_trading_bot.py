@@ -63,6 +63,9 @@ class BotSession:
         
         # Profit lock engine states
         self.profit_lock_states: dict[str, ProfitLockState] = {}
+        
+        # Supabase TTL cleanup state
+        self.last_supabase_cleanup_at = None
 
 # Multi-user session registry: one BotSession per (user_id, mode)
 SESSIONS: dict[tuple[str | None, str | None], "BotSession"] = {}
@@ -99,7 +102,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.common.exceptions import APIError
-from profit_lock_engine import profit_lock_step
+from profit_lock_engine import profit_lock_step, cleanup_old_profit_lock_states
 import pandas as pd
 import time
 import datetime
@@ -161,6 +164,50 @@ def supabase_log(message: str) -> None:
         }).execute()
     except Exception as e:
         logging.error(f"Supabase log error: {e}")
+
+def cleanup_old_supabase_rows() -> None:
+    """
+    STEP 3: Clean up old rows from bot_logs and equity_history tables.
+    Deletes rows older than CLEANUP_TTL_DAYS.
+    Fails silently if Supabase unavailable.
+    """
+    global supabase, SESSION
+    
+    # STEP 6: Safety guards
+    if supabase is None:
+        return
+    
+    user_id = getattr(SESSION, "USER_ID", None)
+    mode = getattr(SESSION, "CURRENT_MODE", None)
+    if user_id is None or mode is None:
+        return
+    
+    from datetime import datetime, timedelta
+    cutoff = datetime.utcnow() - timedelta(days=CLEANUP_TTL_DAYS)
+    cutoff_str = cutoff.isoformat()
+    
+    n_logs = 0
+    n_equity = 0
+    
+    # Clean bot_logs
+    try:
+        result = supabase.table("bot_logs").delete().lt("created_at", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
+        if hasattr(result, 'data') and result.data:
+            n_logs = len(result.data)
+    except Exception:
+        pass  # Fail silently
+    
+    # Clean equity_history
+    try:
+        result = supabase.table("equity_history").delete().lt("timestamp", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
+        if hasattr(result, 'data') and result.data:
+            n_equity = len(result.data)
+    except Exception:
+        pass  # Fail silently
+    
+    # STEP 4: Log only if rows were deleted
+    if n_logs > 0 or n_equity > 0:
+        logging.info(f"[CLEANUP] Deleted {n_logs} bot_logs rows and {n_equity} equity_history rows older than 7 days")
 
 # Rate-limited transparency logging (prevents spam)
 _last_reason_log: dict[str, datetime.datetime] = {}
@@ -1089,6 +1136,11 @@ def close_position(symbol):
                 f"ticker_locked | {symbol} | reason=loss_exit "
                 f"| rsi={state.lock_rsi} atr_pct={state.lock_atr_pct} score={state.lock_score}"
             )
+        
+        # STEP 6: Event-based cleanup on position close
+        if symbol in SESSION.profit_lock_states:
+            del SESSION.profit_lock_states[symbol]
+        
         return pnl
     except Exception as e:
         logging.error(f"Failed to close {symbol}: {e}")
@@ -1518,6 +1570,10 @@ PROFIT_LOCK_COSTS_PCT = 0.0008
 PROFIT_LOCK_MIN_STEP_PCT = 0.0005
 PROFIT_LOCK_COOLDOWN_SEC = 20
 
+# Supabase TTL cleanup constants
+CLEANUP_TTL_DAYS = 7
+SUPABASE_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours
+
 # Position sizing caps
 MIN_DOLLARS_PER_TRADE = 0.0  # We allow very small fractional trades
 MAX_EQUITY_FRACTION_PER_TICKER = MAX_TICKER_EXPOSURE  # reuse your 30% cap
@@ -1746,8 +1802,22 @@ async def trade_loop_async(allowed_tickers=None):
         pass
     last_ticker_refresh = ny_now()
     last_heartbeat_log = ny_now()
+    loop_counter = 0  # STEP 5: Loop counter for periodic cleanup
     while True:
         try:
+            # STEP 5: Periodic profit lock state cleanup (every ~60 iterations ≈ 1 hour)
+            loop_counter += 1
+            if loop_counter % 60 == 0:
+                cleaned_count = cleanup_old_profit_lock_states(SESSION.profit_lock_states)
+                if cleaned_count > 0:
+                    logging.info(f"[MEMORY] Cleaned {cleaned_count} stale profit lock states (TTL=7d)")
+            
+            # STEP 5: Throttled Supabase cleanup (every 6 hours)
+            if (SESSION.last_supabase_cleanup_at is None or 
+                (now - SESSION.last_supabase_cleanup_at).total_seconds() >= SUPABASE_CLEANUP_INTERVAL_SECONDS):
+                cleanup_old_supabase_rows()
+                SESSION.last_supabase_cleanup_at = now
+            
             # Market state check with throttling (max once per 30 seconds)
             now = ny_now()
             if (SESSION.last_clock_check is None or 
@@ -2038,7 +2108,7 @@ async def process_ticker(ticker):
         # ================ SMART EXIT LOGIC (if holding) ================
         # C) FIX EXIT LOGIC CONFLICTS WITH BRACKET ORDERS
         if have_position:
-            # STEP 3-5: Profit lock engine integration
+            # STEP 7: Safety guard for invalid states - skip if entry_price <= 0 or qty <= 0
             if pos_qty > 0 and entry_price > 0 and close_price > 0:
                 # Create/update profit lock state
                 st = SESSION.profit_lock_states.get(ticker)

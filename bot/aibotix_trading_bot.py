@@ -173,6 +173,10 @@ def cleanup_old_supabase_rows() -> None:
     """
     global supabase, SESSION
     
+    # FIX 1: Define now at the top to prevent scoping issues
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    
     # STEP 6: Safety guards
     if supabase is None:
         return
@@ -182,8 +186,7 @@ def cleanup_old_supabase_rows() -> None:
     if user_id is None or mode is None:
         return
     
-    from datetime import datetime, timedelta
-    cutoff = datetime.utcnow() - timedelta(days=CLEANUP_TTL_DAYS)
+    cutoff = now - timedelta(days=CLEANUP_TTL_DAYS)
     cutoff_str = cutoff.isoformat()
     
     n_logs = 0
@@ -200,7 +203,10 @@ def cleanup_old_supabase_rows() -> None:
     # Clean equity_history
     try:
         result = supabase.table("equity_history").delete().lt("timestamp", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
-        if hasattr(result, 'data') and result.data:
+        # FIX 3: Handle non-200/204 responses silently
+        if hasattr(result, 'data') and result.data and hasattr(result, 'status_code') and result.status_code in [200, 204]:
+            n_equity = len(result.data)
+        elif hasattr(result, 'data') and result.data:
             n_equity = len(result.data)
     except Exception:
         pass  # Fail silently
@@ -1815,8 +1821,12 @@ async def trade_loop_async(allowed_tickers=None):
             # STEP 5: Throttled Supabase cleanup (every 6 hours)
             if (SESSION.last_supabase_cleanup_at is None or 
                 (now - SESSION.last_supabase_cleanup_at).total_seconds() >= SUPABASE_CLEANUP_INTERVAL_SECONDS):
-                cleanup_old_supabase_rows()
-                SESSION.last_supabase_cleanup_at = now
+                # FIX 2: Wrap cleanup in try/except to prevent trade_loop crash
+                try:
+                    cleanup_old_supabase_rows()
+                    SESSION.last_supabase_cleanup_at = now
+                except Exception as e:
+                    logging.warning(f"Supabase cleanup failed: {e}")
             
             # Market state check with throttling (max once per 30 seconds)
             now = ny_now()

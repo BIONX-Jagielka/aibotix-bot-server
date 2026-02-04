@@ -167,17 +167,22 @@ def supabase_log(message: str) -> None:
 
 def cleanup_old_supabase_rows() -> None:
     """
-    STEP 3: Clean up old rows from bot_logs and equity_history tables.
+    Clean up old rows from bot_logs and equity_history tables.
     Deletes rows older than CLEANUP_TTL_DAYS.
-    Fails silently if Supabase unavailable.
+    All throttling logic handled internally.
     """
     global supabase, SESSION
     
-    # FIX 1: Define now at the top to prevent scoping issues
+    # Define now at the very first executable line
     from datetime import datetime, timedelta
     now = datetime.utcnow()
     
-    # STEP 6: Safety guards
+    # Check cleanup interval (throttling logic moved inside function)
+    if (SESSION.last_supabase_cleanup_at is not None and 
+        (now - SESSION.last_supabase_cleanup_at).total_seconds() < SUPABASE_CLEANUP_INTERVAL_SECONDS):
+        return  # Interval has not elapsed
+    
+    # Safety guards
     if supabase is None:
         return
     
@@ -186,34 +191,45 @@ def cleanup_old_supabase_rows() -> None:
     if user_id is None or mode is None:
         return
     
-    cutoff = now - timedelta(days=CLEANUP_TTL_DAYS)
-    cutoff_str = cutoff.isoformat()
-    
-    n_logs = 0
-    n_equity = 0
-    
-    # Clean bot_logs
+    # Wrap full cleanup execution in try/except
     try:
-        result = supabase.table("bot_logs").delete().lt("created_at", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
-        if hasattr(result, 'data') and result.data:
-            n_logs = len(result.data)
-    except Exception:
-        pass  # Fail silently
-    
-    # Clean equity_history
-    try:
-        result = supabase.table("equity_history").delete().lt("timestamp", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
-        # FIX 3: Handle non-200/204 responses silently
-        if hasattr(result, 'data') and result.data and hasattr(result, 'status_code') and result.status_code in [200, 204]:
-            n_equity = len(result.data)
-        elif hasattr(result, 'data') and result.data:
-            n_equity = len(result.data)
-    except Exception:
-        pass  # Fail silently
-    
-    # STEP 4: Log only if rows were deleted
-    if n_logs > 0 or n_equity > 0:
-        logging.info(f"[CLEANUP] Deleted {n_logs} bot_logs rows and {n_equity} equity_history rows older than 7 days")
+        cutoff = now - timedelta(days=CLEANUP_TTL_DAYS)
+        cutoff_str = cutoff.isoformat()
+        
+        n_logs = 0
+        n_equity = 0
+        
+        # Clean bot_logs
+        try:
+            result = supabase.table("bot_logs").delete().lt("created_at", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
+            if hasattr(result, 'data') and result.data:
+                n_logs = len(result.data)
+        except Exception:
+            pass  # Fail silently
+        
+        # Clean equity_history
+        try:
+            result = supabase.table("equity_history").delete().lt("timestamp", cutoff_str).eq("user_id", user_id).eq("mode", mode).execute()
+            # Handle non-200/204 responses silently
+            if hasattr(result, 'data') and result.data and hasattr(result, 'status_code') and result.status_code in [200, 204]:
+                n_equity = len(result.data)
+            elif hasattr(result, 'data') and result.data:
+                n_equity = len(result.data)
+        except Exception:
+            pass  # Fail silently
+        
+        # Log only if rows were deleted
+        if n_logs > 0 or n_equity > 0:
+            logging.info(f"[CLEANUP] Deleted {n_logs} bot_logs rows and {n_equity} equity_history rows older than 7 days")
+        
+        # Update timestamp after cleanup attempt completes (even if 0 rows deleted)
+        SESSION.last_supabase_cleanup_at = now
+        
+    except Exception as e:
+        # Log exactly one warning on any exception
+        logging.warning(f"Supabase cleanup failed: {e}")
+        # Still update timestamp to prevent constant retries
+        SESSION.last_supabase_cleanup_at = now
 
 # Rate-limited transparency logging (prevents spam)
 _last_reason_log: dict[str, datetime.datetime] = {}
@@ -1818,15 +1834,8 @@ async def trade_loop_async(allowed_tickers=None):
                 if cleaned_count > 0:
                     logging.info(f"[MEMORY] Cleaned {cleaned_count} stale profit lock states (TTL=7d)")
             
-            # STEP 5: Throttled Supabase cleanup (every 6 hours)
-            if (SESSION.last_supabase_cleanup_at is None or 
-                (now - SESSION.last_supabase_cleanup_at).total_seconds() >= SUPABASE_CLEANUP_INTERVAL_SECONDS):
-                # FIX 2: Wrap cleanup in try/except to prevent trade_loop crash
-                try:
-                    cleanup_old_supabase_rows()
-                    SESSION.last_supabase_cleanup_at = now
-                except Exception as e:
-                    logging.warning(f"Supabase cleanup failed: {e}")
+            # Supabase cleanup (throttling handled inside function)
+            cleanup_old_supabase_rows()
             
             # Market state check with throttling (max once per 30 seconds)
             now = ny_now()

@@ -1,6 +1,31 @@
 from __future__ import annotations
 
 from profit_lock_engine import ProfitLockState
+
+# === Phase 1: Reliability Integration ===
+try:
+    # Import reliability components
+    import sys
+    import os
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    
+    from aibotix.utils.http_client import ResilientSession, HttpConfig
+    from aibotix.data.fetcher import RobustDataFetcher
+    from aibotix.selector.stable_selector import StableAISelector
+    from aibotix.trading.stop_orders import ReliableStopManager
+    from aibotix.observability import log_structured, MetricEvent
+    
+    RELIABILITY_AVAILABLE = True
+except ImportError as e:
+    print(f"WARNING: Reliability modules not available: {e}")
+    RELIABILITY_AVAILABLE = False
+
+# Global reliability manager (initialized later)
+_reliability_manager = None
+
 # --- BotSession container for state (Patch B foundation) ---
 
 # Global client registry for equity snapshots
@@ -48,6 +73,30 @@ class BotSession:
         self.market_close_guard_until = None  # datetime; used to suppress trading after close sequence starts
         self.last_clock_check = None
         self.last_market_state_log = None
+        
+        # AI ticker management
+        self.last_ai_refresh = None
+        self.last_pnl_update = None
+        
+        # Ticker evaluation throttling
+        self.last_ticker_eval = {}  # ticker -> datetime
+        
+        # Graduated risk management state
+        self.risk_state = "NORMAL"  # NORMAL | DEGRADED | HALT
+        self.last_risk_state_log = None
+        self.per_ticker_loss_cooldown = {}  # ticker -> datetime until which ticker is cooled
+        
+        # Profit lock engine states
+        self.profit_lock_states: dict[str, ProfitLockState] = {}
+        
+        # Supabase TTL cleanup state
+        self.last_supabase_cleanup_at = None
+        
+        # Phase 1: Reliability components
+        self.reliability_initialized = False
+        self.robust_data_fetcher = None
+        self.stable_ai_selector = None  # Actually a stability filter, not selector
+        self.reliable_stop_manager = None
         
         # AI ticker management
         self.last_ai_refresh = None
@@ -245,6 +294,72 @@ def reason_log(key: str, message: str, min_seconds: int = 120) -> None:
         return
     _last_reason_log[key] = now
     supabase_log(message)
+
+def ui_log(key: str, message: str, min_seconds: int = 60) -> None:
+    """Rate-limited user-friendly log message."""
+    try:
+        reason_log(key, message, min_seconds)
+    except Exception as e:
+        logging.error(f"UI log failed: {e}")
+
+# Section 5: Data degraded position management
+async def handle_degraded_positions(degraded_stats: dict) -> None:
+    """
+    Handle existing positions during data degraded state
+    - Do not open new positions
+    - Manage existing positions with last known price
+    - Flatten positions if no price update > 3 minutes (failsafe)
+    """
+    global SESSION
+    if SESSION.api is None:
+        return
+        
+    try:
+        current_positions = SESSION.api.get_all_positions()
+        
+        for position in current_positions:
+            symbol = position.symbol
+            qty = float(position.qty)
+            
+            # Track last price update time per symbol
+            if not hasattr(SESSION, 'last_price_update'):
+                SESSION.last_price_update = {}
+            
+            # Try to get current price
+            current_price = get_last_trade_price(symbol)
+            now = time.time()
+            
+            if current_price is not None:
+                SESSION.last_price_update[symbol] = now
+            else:
+                # Check how long since last price update
+                last_update = SESSION.last_price_update.get(symbol, now)
+                minutes_stale = (now - last_update) / 60
+                
+                if minutes_stale > 3:
+                    # Force flatten position due to stale price data
+                    logging.warning(
+                        f"[RISK] forced_exit_price_stale: {symbol}, minutes_stale={minutes_stale:.1f}",
+                        extra={
+                            "event_type": "forced_exit_price_stale",
+                            "symbol": symbol,
+                            "minutes_stale": minutes_stale
+                        }
+                    )
+                    
+                    try:
+                        SESSION.api.close_position(symbol)
+                        logging.info(f"Flattened position {symbol} due to stale price data")
+                        
+                        # Clean up tracking
+                        if symbol in SESSION.last_price_update:
+                            del SESSION.last_price_update[symbol]
+                            
+                    except Exception as e:
+                        logging.error(f"Failed to flatten stale position {symbol}: {e}")
+                        
+    except Exception as e:
+        logging.error(f"Error in degraded position management: {e}")
 
 def ui_log(key: str, message: str, min_seconds: int = 60) -> None:
     """Rate-limited user-friendly log message."""
@@ -523,6 +638,56 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # WARNING:
 # These globals are safe because AIBOTIX currently runs one active bot per worker.
 # When multi-bot support is added, move these into per-session state.
+def init_reliability_components(session: BotSession):
+    """Initialize Phase 1 reliability components for a session"""
+    if not RELIABILITY_AVAILABLE or session.reliability_initialized:
+        return
+        
+    try:
+        # Create HTTP session with production config
+        http_config = HttpConfig(
+            base_timeout=12.0,
+            max_retries=3,
+            base_delay=0.4,
+            max_delay=4.0,
+            jitter=True,
+            ssl_error_retries=2
+        )
+        http_session = ResilientSession(http_config)
+        
+        # Initialize robust data fetcher
+        session.robust_data_fetcher = RobustDataFetcher(
+            alpaca_data_client=session.data_client,
+            session=http_session
+        )
+        
+        # Initialize stability filter (wrapper around existing AI selector)
+        # NOTE: This does NOT replace the existing AI selector but provides optional filtering
+        from aibotix.selector.stable_selector import StabilityFilter
+        session.stable_ai_selector = StabilityFilter()
+        
+        # Initialize reliable stop manager  
+        session.reliable_stop_manager = ReliableStopManager(
+            alpaca_trading_client=session.api,
+            session=http_session
+        )
+        
+        session.reliability_initialized = True
+        
+        if RELIABILITY_AVAILABLE:
+            log_structured(MetricEvent(
+                event_type="reliability_init",
+                user_id=session.USER_ID,
+                mode=session.CURRENT_MODE,
+                components=["data_fetcher", "stability_filter", "stop_manager"]
+            ))
+        
+        logging.info(f"Reliability components initialized for {session.USER_ID}:{session.CURRENT_MODE}")
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize reliability components: {e}")
+        session.reliability_initialized = False
+
 def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_id: str | None = None, mode: str | None = None):
     """
     Initialize trading and data clients for the correct environment (paper or live)
@@ -574,6 +739,9 @@ def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_
 
     # Keep SESSION globally updated
     SESSION = session
+    
+    # Initialize Phase 1 reliability components
+    init_reliability_components(session)
 
     logging.info(f"[Client Init] mode={effective_mode} paper={paper_mode}")
     supabase_log(f"client_initialised | mode={effective_mode} | paper={paper_mode}")
@@ -1171,8 +1339,28 @@ def close_position(symbol):
 def cancel_replace_stop_for_symbol(alpaca_client, symbol: str, qty: float, stop_price: float, existing_order_id: str | None):
     """
     Cancel previous stop (if provided), then place a new stop-market sell for 'qty' at 'stop_price'.
+    Uses reliable stop manager when available.
     Returns: new_order_id (or None if placement failed).
     """
+    # Try reliable stop manager first
+    if (SESSION.reliability_initialized and 
+        SESSION.reliable_stop_manager is not None):
+        try:
+            success = SESSION.reliable_stop_manager.manage_stop_order(
+                symbol=symbol,
+                stop_price=stop_price,
+                quantity=qty,
+                side="sell"
+            )
+            if success:
+                active_stops = SESSION.reliable_stop_manager.get_active_stops()
+                stop_order = active_stops.get(symbol)
+                if stop_order:
+                    return stop_order.order_id
+        except Exception as e:
+            logging.warning(f"Reliable stop manager failed for {symbol}: {e}, using fallback")
+    
+    # Fallback to original implementation
     # Cancel old stop if exists
     if existing_order_id:
         try:
@@ -1461,7 +1649,42 @@ def scale_qty_by_score(qty, score):
         return qty
 
 def fetch_data(symbol):
+    """
+    Fetch market data with Phase 1 reliability upgrades
+    Falls back to original implementation if reliability components unavailable
+    """
     global data_client
+    
+    # Try reliability-enhanced fetch first
+    if (SESSION.reliability_initialized and 
+        SESSION.robust_data_fetcher is not None):
+        try:
+            df = SESSION.robust_data_fetcher.fetch_bars_with_quality_check(
+                symbol, timeframe="1Min", limit=1500
+            )
+            
+            if df is not None and len(df) >= MIN_BARS_REQUIRED:
+                # Calculate indicators on the fetched data
+                df = strategy.calculate_indicators(df.copy())
+                
+                # Apply same validation as original implementation
+                latest_row = df.iloc[-1]
+                critical_indicators = ['RSI', 'ATR', 'ATR_PCT']
+                for indicator in critical_indicators:
+                    if indicator in df.columns and pd.isna(latest_row[indicator]):
+                        mark_exec_bad_ticker(symbol, "indicator_nan")
+                        return None
+                
+                needed_cols = [c for c in ['RSI', 'ATR', 'ATR_PCT'] if c in df.columns]
+                if df[needed_cols].dropna().shape[0] < 3:
+                    logging.warning(f"{symbol}: Not enough valid RSI/ATR data. Skipping.")
+                    return None
+                    
+                return df
+        except Exception as e:
+            logging.warning(f"Robust fetch failed for {symbol}: {e}, falling back to original")
+    
+    # Fallback to original implementation
     if data_client is None:
         logging.error("Data client not initialised. Cannot fetch bar data.")
         return None
@@ -1518,6 +1741,7 @@ def fetch_data(symbol):
         return df
     except Exception as e:
         logging.error(f"{symbol}: Data/indicator failure - {e}")
+        return None
         mark_exec_bad_ticker(symbol, "indicator_exception")
         return None
 
@@ -1905,6 +2129,18 @@ async def trade_loop_async(allowed_tickers=None):
                 (now - SESSION.last_pnl_update).total_seconds() >= 60):
                 await update_pnl_async()
                 SESSION.last_pnl_update = now
+                
+            # 2.5. Section 5: Data degraded position management
+            try:
+                from aibotix.data.bars import is_data_degraded
+                data_degraded, degraded_stats = is_data_degraded()
+                
+                if data_degraded:
+                    # Do not open new positions in degraded mode
+                    # Manage existing positions using last known price with stale price failsafe
+                    await handle_degraded_positions(degraded_stats)
+            except ImportError:
+                pass  # Graceful degradation if bars module not available
             # 3. AI Ticker selection & active ticker maintenance (open market only)
             fresh_ai_tickers = []
             if SESSION.market_state == "OPEN":
@@ -1918,6 +2154,22 @@ async def trade_loop_async(allowed_tickers=None):
                             SESSION.USER_ID,
                             SESSION.CURRENT_MODE
                         )
+                        
+                        # Optional: Apply stability filter if reliability components are available
+                        if (SESSION.reliability_initialized and 
+                            SESSION.stable_ai_selector is not None and
+                            fresh_ai_tickers):
+                            try:
+                                # Apply optional post-processing filter (currently a pass-through)
+                                filtered_tickers = SESSION.stable_ai_selector.filter_ai_selection(
+                                    fresh_ai_tickers, max_symbols=30
+                                )
+                                if filtered_tickers != fresh_ai_tickers:
+                                    reason_log("ai_filter", f"Stability filter: {len(fresh_ai_tickers)} → {len(filtered_tickers)} tickers", min_seconds=300)
+                                fresh_ai_tickers = filtered_tickers
+                            except Exception as e:
+                                logging.warning(f"Stability filter failed, using original AI selection: {e}")
+                        
                         SESSION.last_ai_refresh = now
                         if fresh_ai_tickers:
                             reason_log("ai_refresh", f"AI refresh: got {len(fresh_ai_tickers)} fresh tickers", min_seconds=300)
@@ -1991,6 +2243,33 @@ async def trade_loop_async(allowed_tickers=None):
                 list(SESSION.ACTIVE_TICKERS)[-20:]  # Keep last 20 active tickers for momentum
             ))
             
+            # 6. Phase 1 Reliability: Periodic maintenance (every 5 minutes)
+            if (SESSION.reliability_initialized and 
+                hasattr(SESSION, 'last_reliability_maintenance')):
+                
+                time_since_maintenance = (now - getattr(SESSION, 'last_reliability_maintenance', now - datetime.timedelta(minutes=10))).total_seconds()
+                
+                if time_since_maintenance >= 300:  # 5 minutes
+                    try:
+                        # Sync stops with broker
+                        if SESSION.reliable_stop_manager:
+                            sync_results = SESSION.reliable_stop_manager.sync_with_broker()
+                            successful_syncs = sum(1 for success in sync_results.values() if success)
+                            if successful_syncs > 0:
+                                reason_log("stop_sync", f"Synced {successful_syncs}/{len(sync_results)} stops with broker", min_seconds=300)
+                            
+                            # Clean up old stops
+                            SESSION.reliable_stop_manager.cleanup_old_stops()
+                        
+                        SESSION.last_reliability_maintenance = now
+                        
+                    except Exception as e:
+                        logging.warning(f"Reliability maintenance failed: {e}")
+                        
+            elif SESSION.reliability_initialized:
+                # Initialize maintenance timestamp
+                SESSION.last_reliability_maintenance = now
+            
             # Clean evaluation cycle complete
             reason_log("eval_complete", f"Evaluation cycle complete | Active positions: {len(current_positions)} | Market: {SESSION.market_state}", min_seconds=120)
             
@@ -2012,6 +2291,38 @@ async def trade_loop_async(allowed_tickers=None):
 async def process_ticker(ticker):
     try:
         await asyncio.sleep(random.uniform(0.2, 0.6))
+        
+        # Phase 1: Check for reliable stop triggers first
+        if (SESSION.reliability_initialized and 
+            SESSION.reliable_stop_manager is not None):
+            try:
+                # Get current price for stop check
+                current_prices = {}
+                try:
+                    # Quick price fetch for stop checking
+                    req = StockLatestTradeRequest(symbol_or_symbols=[ticker])
+                    trade = SESSION.data_client.get_stock_latest_trade(req)
+                    if ticker in trade and hasattr(trade[ticker], 'price'):
+                        current_prices[ticker] = float(trade[ticker].price)
+                        
+                        # Check for stop triggers
+                        triggers = SESSION.reliable_stop_manager.check_stop_triggers(current_prices)
+                        if ticker in triggers:
+                            trigger_info = triggers[ticker]
+                            logging.info(f"RELIABLE_STOP_TRIGGERED {ticker} price={trigger_info['price']:.4f} reason={trigger_info['reason']}")
+                            
+                            # Execute market exit
+                            if close_position_market(SESSION.api, ticker):
+                                supabase_log(f"exit | {ticker} | reliable_stop_triggered | price={trigger_info['price']:.4f}")
+                                
+                            # Remove from stop tracking
+                            SESSION.reliable_stop_manager.remove_stop(ticker, reason="triggered")
+                            return
+                except Exception as e:
+                    # Don't fail the entire ticker processing on stop check failure
+                    logging.warning(f"Stop trigger check failed for {ticker}: {e}")
+            except Exception as e:
+                logging.warning(f"Reliable stop processing failed for {ticker}: {e}")
         
         # Execution-level bad ticker cooldown
         bad_until = SESSION.bad_ticker_until.get(ticker)

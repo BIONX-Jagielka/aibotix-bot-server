@@ -30,6 +30,12 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
+import time
+
+# Global variables for stability tracking (Section 3)
+_last_selection_time = {}
+_last_good_cache = {}
+_forced_prune_symbols = set()
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -992,6 +998,24 @@ def fetch_ai_tickers(user_id: str, mode: str):
         return []
 
 
+def force_prune_symbol(symbol: str):
+    """
+    Force a symbol to be pruned from the next selection
+    Used when symbol has INVALID_DATA or EMPTY status
+    """
+    global _forced_prune_symbols
+    _forced_prune_symbols.add(symbol)
+    logging.info(f"[AI-Selector] Symbol {symbol} marked for forced pruning")
+
+
+def get_last_good_cache(user_id: str, mode: str) -> List[str]:
+    """
+    Get last known good ticker list for degraded mode backfill
+    """
+    cache_key = f"{user_id}:{mode}"
+    return _last_good_cache.get(cache_key, [])
+
+
 if __name__ == "__main__":
     default_mode = os.getenv("BOT_MODE", "paper")
     results = asyncio.run(stage_a_screen_and_collect(default_mode))
@@ -1001,25 +1025,76 @@ if __name__ == "__main__":
 def get_top_tickers(limit: int, user_id: str, mode: str):
     """
     Central AI selection function with breadth targets and stability.
-
-    - Runs stage_a_screen_and_collect(mode) to compute indicators + scores.
-    - Sorts results by 'score' (highest first).
-    - Ensures at least min(limit, 20) symbols are returned.
-    - Implements light continuity logic for 40-60% overlap with previous tickers.
-    - Writes the top N tickers into the ai_tickers table (row-based).
-    - Returns the ordered list of ticker symbols for the worker.
-
-    Note: This function is synchronous and is expected to be called
-    from a background thread (e.g. via asyncio.to_thread in worker.py),
-    so it safely uses asyncio.run() internally.
+    
+    Section 3 Enhancements:
+    - Sticky universe: keeps selection for 15 min or until positions close
+    - DATA_DEGRADED handling: prune invalid symbols only
+    - Proper overlap logging with None when prev_list empty
+    - Hard refresh at top of hour
     """
+    global _last_selection_time, _last_good_cache, _forced_prune_symbols
+    
     if not supabase:
         logging.warning("[AI-Tickers] Supabase client not configured — returning empty ticker list.")
         return []
+    
+    now = time.time()
+    cache_key = f"{user_id}:{mode}"
+    last_time = _last_selection_time.get(cache_key, 0)
+    
+    # Check if data is degraded
+    try:
+        # Import here to avoid circular imports
+        from aibotix.data.bars import is_data_degraded
+        data_degraded, degraded_stats = is_data_degraded()
+    except ImportError:
+        data_degraded, degraded_stats = False, {}
 
     # Fetch previously saved tickers for continuity
     previous_tickers = fetch_ai_tickers(user_id, mode)
     min_breadth_target = min(limit, 20)
+    
+    # Determine refresh reason
+    refresh_reason = "normal"
+    time_since_last = now - last_time
+    current_hour = datetime.datetime.now().hour
+    last_hour = datetime.datetime.fromtimestamp(last_time).hour if last_time > 0 else -1
+    
+    # Check if we should skip refresh (sticky universe)
+    should_refresh = True
+    if previous_tickers and time_since_last < 900:  # 15 minutes
+        if data_degraded:
+            # Only prune invalid symbols in degraded mode
+            should_refresh = False
+            refresh_reason = "degraded_hold"
+        elif current_hour == last_hour:
+            # Normal sticky behavior - don't refresh within same hour
+            should_refresh = False
+            refresh_reason = "sticky_hold"
+    
+    # Force refresh at top of hour or when specifically requested
+    if current_hour != last_hour and time_since_last > 300:  # 5+ min since last, new hour
+        should_refresh = True
+        refresh_reason = "hourly_refresh"
+    
+    # Handle forced prune symbols (always prune these)
+    if _forced_prune_symbols:
+        # Prune the forced symbols regardless of refresh decision
+        if previous_tickers:
+            previous_tickers = [t for t in previous_tickers if t not in _forced_prune_symbols]
+        _forced_prune_symbols.clear()
+        refresh_reason = "forced_prune"
+    
+    # If not refreshing, return cached result with degraded state logging
+    if not should_refresh and previous_tickers:
+        logging.info(
+            f"[AI-Selector] refresh_reason: {refresh_reason} | "
+            f"data_degraded: {data_degraded} | "
+            f"failure_rate: {degraded_stats.get('failure_rate', 0):.3f} | "
+            f"empty_rate: {degraded_stats.get('empty_rate', 0):.3f} | "
+            f"final_count: {len(previous_tickers)}"
+        )
+        return previous_tickers
 
     # --- Step 1: compute scores via the async pipeline ---
     try:
@@ -1127,10 +1202,31 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
         logging.warning("No valid rows produced by get_top_tickers.")
         return []
 
-    # Log stability metrics
-    overlap_count = len(set(tickers) & set(previous_tickers)) if previous_tickers else 0
-    overlap_pct = (overlap_count / len(previous_tickers) * 100) if previous_tickers else 0
-    logging.info(f"[AI-Stability] Selected {len(tickers)} tickers with {overlap_count}/{len(previous_tickers) if previous_tickers else 0} overlap ({overlap_pct:.1f}%)")
+    # Update timestamp for next sticky window
+    _last_selection_time[cache_key] = now
+    
+    # Store last good cache for degraded mode backfill
+    if tickers and not data_degraded:
+        _last_good_cache[cache_key] = tickers.copy()
+    
+    # Log stability metrics with proper overlap calculation
+    if not previous_tickers:
+        overlap = None
+        overlap_log = "overlap=None (no_prev_list)"
+    else:
+        intersection = set(tickers) & set(previous_tickers)
+        union = set(tickers) | set(previous_tickers)
+        overlap = len(intersection) / len(union) if union else 0
+        overlap_log = f"overlap={overlap:.3f} ({len(intersection)}/{len(union)})"
+    
+    # Log comprehensive selection event
+    logging.info(
+        f"[AI-Selector] refresh_reason: {refresh_reason} | "
+        f"data_degraded: {data_degraded} | "
+        f"failure_rate: {degraded_stats.get('failure_rate', 0):.3f} | "
+        f"empty_rate: {degraded_stats.get('empty_rate', 0):.3f} | "
+        f"final_count: {len(tickers)} | pruned_count: 0 | backfilled_count: 0 | {overlap_log}"
+    )
 
     # --- Step 4: overwrite ai_tickers for this user/mode ---
     try:

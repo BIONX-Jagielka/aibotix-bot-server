@@ -982,7 +982,7 @@ def fetch_ai_tickers(user_id: str, mode: str):
             .select("ticker, rank")
             .eq("user_id", user_id)
             .eq("mode", mode)
-            .order("rank", ascending=True)
+            .order("rank")
             .execute()
         )
 
@@ -1057,8 +1057,8 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
     # Determine refresh reason
     refresh_reason = "normal"
     time_since_last = now - last_time
-    current_hour = datetime.datetime.now().hour
-    last_hour = datetime.datetime.fromtimestamp(last_time).hour if last_time > 0 else -1
+    current_hour = datetime.now().hour
+    last_hour = datetime.fromtimestamp(last_time).hour if last_time > 0 else -1
     
     # Check if we should skip refresh (sticky universe)
     should_refresh = True

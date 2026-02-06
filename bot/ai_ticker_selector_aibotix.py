@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import random
-from datetime import datetime
+import datetime
 import pytz
 import numpy as np
 import pandas as pd

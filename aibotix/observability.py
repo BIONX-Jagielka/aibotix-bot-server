@@ -22,6 +22,7 @@ class MetricEvent:
     attempt: Optional[int] = None
     elapsed: Optional[float] = None
     count: Optional[int] = None
+    user_id: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
 def inc_metric(name: str, value: int = 1) -> None:

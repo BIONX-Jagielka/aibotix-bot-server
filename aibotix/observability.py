@@ -24,6 +24,7 @@ class MetricEvent:
     count: Optional[int] = None
     user_id: Optional[str] = None
     mode: Optional[str] = None
+    components: Optional[Any] = None
     extra: Optional[Dict[str, Any]] = None
 
 def inc_metric(name: str, value: int = 1) -> None:

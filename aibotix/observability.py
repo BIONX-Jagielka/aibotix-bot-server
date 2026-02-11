@@ -23,6 +23,7 @@ class MetricEvent:
     elapsed: Optional[float] = None
     count: Optional[int] = None
     user_id: Optional[str] = None
+    mode: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
 def inc_metric(name: str, value: int = 1) -> None:

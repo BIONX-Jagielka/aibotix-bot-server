@@ -646,7 +646,7 @@ def init_reliability_components(session: BotSession):
     try:
         # Create HTTP session with production config
         http_config = HttpConfig(
-            base_timeout=12.0,
+            read_timeout=12.0,
             max_retries=3,
             base_delay=0.4,
             max_delay=4.0,

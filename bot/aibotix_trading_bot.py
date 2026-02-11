@@ -1179,6 +1179,15 @@ def place_order(symbol, qty, side):
     try:
         current_price = get_last_trade_price(symbol)
         
+        # FIX 1: Minimum order notional guard
+        notional = float(qty) * float(current_price) if current_price else 0.0
+        MIN_ORDER_NOTIONAL = 1.05
+        
+        if current_price is None or notional < MIN_ORDER_NOTIONAL:
+            logging.info(f"Trade blocked: notional too small ({notional:.2f}) for {symbol}")
+            supabase_log(f"blocked_min_notional | {symbol} | notional={notional:.2f}")
+            return False
+        
         # Get quote for reference pricing
         bid, ask, mid, spread_pct = get_latest_quote(symbol)
         ref_price = ask if side.lower() == 'buy' else bid
@@ -1568,6 +1577,29 @@ async def update_pnl_async():
 
 def calculate_position_size(symbol, risk_per_trade):
     equity = get_equity()
+    
+    # FIX 2: Small account adaptive position sizing
+    SMALL_ACCOUNT_THRESHOLD = 1000
+    
+    if equity < SMALL_ACCOUNT_THRESHOLD:
+        account = get_account()
+        if account is None:
+            return 0.0
+        
+        try:
+            cash = float(account.buying_power)
+        except:
+            return 0.0
+        
+        trade_dollars = cash * 0.25
+        
+        current_price = get_last_trade_price(symbol)
+        if current_price is None or current_price <= 0:
+            return 0.0
+        
+        qty = trade_dollars / current_price
+        return round(max(qty, 0.0), 4)
+    
     # Use only equity after reserving safety buffer
     usable_equity = max(equity * (1 - RESERVE_FUND_PCT), 0)
     
@@ -2117,6 +2149,7 @@ async def trade_loop_async(allowed_tickers=None):
             
             # Only sleep in HALT state, not DEGRADED
             if risk_state == "HALT":
+                supabase_log(f"blocked_risk_state | HALT")
                 logging.warning("Trading HALTED due to risk limits. Sleeping 5 minutes...")
                 await asyncio.sleep(300)
                 continue
@@ -2154,6 +2187,13 @@ async def trade_loop_async(allowed_tickers=None):
                             SESSION.USER_ID,
                             SESSION.CURRENT_MODE
                         )
+                        
+                        # FIX 3: AI selector fallback when empty
+                        if not fresh_ai_tickers or len(fresh_ai_tickers) == 0:
+                            logging.warning("AI returned 0 tickers — activating fallback universe")
+                            fallback_tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
+                            SESSION.ACTIVE_TICKERS = fallback_tickers
+                            supabase_log("ai_fallback_universe_activated")
                         
                         # Optional: Apply stability filter if reliability components are available
                         if (SESSION.reliability_initialized and 
@@ -2331,6 +2371,7 @@ async def process_ticker(ticker):
         
         # Per-ticker loss cooldown check
         if is_ticker_in_cooldown(ticker):
+            supabase_log(f"blocked_cooldown | {ticker}")
             return
         
         # Respect global halts
@@ -2373,6 +2414,7 @@ async def process_ticker(ticker):
 
         # Quick volatility guard
         if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+            supabase_log(f"blocked_atr_bounds | {ticker}")
             reason_log(
                 f"atr_skip:{ticker}",
                 f"entry_blocked | {ticker} | reason=atr_out_of_range | score={score} rsi={rsi} atr_pct={atr_pct}",
@@ -2389,9 +2431,11 @@ async def process_ticker(ticker):
             elif spread_pct > (MAX_SPREAD_ATR_FRACTION * atr_pct):
                 spread_size_mult = 0.60
         
+        # FIX 4: Explicit trade block reason logging
         # Keep existing logging for wide spreads (but don't block the trade)
         if not spread_is_acceptable(spread_pct, atr_pct) and not have_position:
             # Spread is handled via size reduction, not hard veto
+            supabase_log(f"blocked_spread | {ticker}")
             reason_log(
                 f"spread_soft:{ticker}",
                 f"spread_softened | {ticker} | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
@@ -2738,11 +2782,13 @@ async def process_ticker(ticker):
                 rsi_size_mult = 0.60  # Reduced size for high RSI
                 logging.debug(f"[RSI SIZE REDUCTION] {ticker} | rsi={rsi:.1f} max_allowed={rsi_max_allowed} mult={rsi_size_mult}")
             else:
+                supabase_log(f"blocked_rsi | {ticker}")
                 logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=RSI_TOO_HIGH rsi={rsi:.1f} max={rsi_max_allowed}")
                 return
 
         # 2. ATR volatility filter (avoid weak or explosive regimes)
         if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+            supabase_log(f"blocked_atr_bounds | {ticker}")
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=ATR_RANGE atr_pct={atr_pct:.4f}")
             return
 
@@ -2903,8 +2949,8 @@ async def process_ticker(ticker):
         # Phase 1 Safety: Buying power guard
         required_dollars = qty * close_price
         if not has_sufficient_buying_power(required_dollars):
+            supabase_log(f"blocked_buying_power | {ticker}")
             logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=INSUFFICIENT_BUYING_POWER required=${required_dollars:.2f}")
-            supabase_log("entry_blocked | insufficient_buying_power")
             # ui_log(
             #     f"bp_{ticker}",
             #     f"{ticker}: Entry skipped — insufficient buying power.",

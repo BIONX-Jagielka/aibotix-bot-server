@@ -648,10 +648,8 @@ def init_reliability_components(session: BotSession):
         http_config = HttpConfig(
             read_timeout=12.0,
             max_retries=3,
-            base_delay=0.4,
-            max_delay=4.0,
-            jitter=True,
-            ssl_error_retries=2
+            backoff_base=0.4,
+            backoff_cap=4.0
         )
         http_session = ResilientSession(http_config)
         

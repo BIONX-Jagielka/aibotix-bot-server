@@ -71,7 +71,7 @@ def init_clients(mode: Optional[str] = None) -> Tuple[StockHistoricalDataClient,
         )
 
     # Now safely initialise clients
-    data_client = StockHistoricalDataClient(api_key, api_secret)
+    data_client = StockHistoricalDataClient(api_key, api_secret, feed="iex")
     trading_client = TradingClient(api_key, api_secret, paper=paper)
 
     return data_client, trading_client
@@ -142,7 +142,7 @@ def _mark_bad_data(symbol: str):
 async def fetch_indicators(symbol: str, mode: str):
     try:
         data_client, trading_client = init_clients(mode)
-        bars_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=100)
+        bars_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=100, feed="iex")
         bars = data_client.get_stock_bars(bars_req).df
         if bars.empty:
             _mark_bad_data(symbol)
@@ -192,7 +192,8 @@ def compute_historical_context(symbol: str, mode: str) -> dict | None:
         bars_req = StockBarsRequest(
             symbol_or_symbols=symbol, 
             timeframe=TimeFrame.Day, 
-            limit=HISTORICAL_LOOKBACK_DAYS
+            limit=HISTORICAL_LOOKBACK_DAYS,
+            feed="iex"
         )
         bars = data_client.get_stock_bars(bars_req).df
         
@@ -287,7 +288,7 @@ async def stage_a_screen_and_collect(mode: str, limit: int = 5):
             continue
         try:
             logging.debug(f"Checking symbol: {symbol}")
-            d_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=5)
+            d_req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=5, feed="iex")
             bars = data_client.get_stock_bars(d_req).df
 
             # If no data, mark as failed and skip *before* trying to access bars.iloc[-1]

@@ -180,7 +180,7 @@ def fetch_minute_bars(symbols: List[str], limit: int = 100, timeframe: str = "1M
         try:
             # Use appropriate timeframe
             tf = TimeFrame.Minute if timeframe == "1Min" else TimeFrame.Day
-            request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit)
+            request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, limit=limit, feed="iex")
             response = data_client.get_stock_bars(request)
             
             # Handle MultiIndex case

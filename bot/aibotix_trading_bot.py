@@ -717,7 +717,7 @@ def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_
     api = TradingClient(api_key, api_secret, paper=paper_mode)
 
     # Create Alpaca Data client for correct environment
-    data_client = StockHistoricalDataClient(api_key, api_secret)
+    data_client = StockHistoricalDataClient(api_key, api_secret, feed="iex")
     # ----------------------------------------------------
 
     # Store clients in registry for equity snapshots
@@ -949,7 +949,7 @@ def get_last_trade_price(symbol):
         logging.error("Data client not initialised. Cannot fetch last trade price.")
         return None
     try:
-        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+        req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed="iex")
         trade = data_client.get_stock_latest_trade(req)
         obj = trade.get(symbol) if isinstance(trade, dict) else trade
         price = getattr(obj, 'price', None)
@@ -1407,7 +1407,7 @@ def get_latest_quote(symbol):
         if SESSION.data_client is None:
             return (None, None, None, None)
         
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex")
         quote_response = SESSION.data_client.get_stock_latest_quote(req)
         
         if symbol not in quote_response:
@@ -1720,7 +1720,7 @@ def fetch_data(symbol):
         return None
     try:
         # Try minute bars first
-        req_min = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=1500)
+        req_min = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, limit=1500, feed="iex")
         bars_min = data_client.get_stock_bars(req_min).df
         if isinstance(bars_min.index, pd.MultiIndex):
             try:
@@ -1732,7 +1732,7 @@ def fetch_data(symbol):
         df = bars_min
         if df.empty or len(df) < RSI_PERIOD + 1:
             logging.warning(f"{symbol}: Minute bars too short or missing. Trying daily fallback...")
-            req_day = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=100)
+            req_day = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=100, feed="iex")
             bars_day = data_client.get_stock_bars(req_day).df
             if isinstance(bars_day.index, pd.MultiIndex):
                 try:
@@ -2338,7 +2338,7 @@ async def process_ticker(ticker):
                 current_prices = {}
                 try:
                     # Quick price fetch for stop checking
-                    req = StockLatestTradeRequest(symbol_or_symbols=[ticker])
+                    req = StockLatestTradeRequest(symbol_or_symbols=[ticker], feed="iex")
                     trade = SESSION.data_client.get_stock_latest_trade(req)
                     if ticker in trade and hasattr(trade[ticker], 'price'):
                         current_prices[ticker] = float(trade[ticker].price)

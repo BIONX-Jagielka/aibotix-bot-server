@@ -1,4 +1,3 @@
-# aibotix/trading/stop_orders.py
 from __future__ import annotations
 import time
 from typing import Optional, Dict, Any, Tuple
@@ -187,6 +186,13 @@ class ReliableStopManager:
                 return True, "local_fallback"
                 
         return False, None
+
+    def check_stop_triggers(self, symbol: str, current_price: float):
+        """
+        Backwards-compatible wrapper for legacy call-sites that expect
+        check_stop_triggers(). Delegates to check_stop_triggered().
+        """
+        return self.check_stop_triggered(symbol, current_price)
     
     def remove_stop(self, symbol: str, reason: str = "manual") -> bool:
         """Remove stop order"""

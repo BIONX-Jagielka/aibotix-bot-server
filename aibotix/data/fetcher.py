@@ -100,7 +100,8 @@ class RobustDataFetcher:
                 timeframe=tf,
                 start=start_time,
                 end=end_time,
-                limit=limit
+                limit=limit,
+                feed="iex"
             )
             
             response = self.alpaca_client.get_stock_bars(request)

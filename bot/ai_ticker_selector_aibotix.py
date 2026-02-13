@@ -85,7 +85,7 @@ def init_clients(mode: Optional[str] = None) -> Tuple[StockHistoricalDataClient,
         )
 
     # Now safely initialise clients
-    data_client = StockHistoricalDataClient(api_key, api_secret, feed="iex")
+    data_client = StockHistoricalDataClient(api_key, api_secret)
     trading_client = TradingClient(api_key, api_secret, paper=paper)
 
     return data_client, trading_client

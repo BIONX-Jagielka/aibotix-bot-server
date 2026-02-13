@@ -710,7 +710,7 @@ def init_trading_client(api_key: str, api_secret: str, paper: bool = True, user_
     api = TradingClient(api_key, api_secret, paper=paper_mode)
 
     # Create Alpaca Data client for correct environment
-    data_client = StockHistoricalDataClient(api_key, api_secret, feed="iex")
+    data_client = StockHistoricalDataClient(api_key, api_secret)
     # ----------------------------------------------------
 
     # Store clients in registry for equity snapshots

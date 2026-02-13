@@ -13,18 +13,32 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from typing import List, Dict, Any, Optional, Tuple
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
+# Module-level Supabase client state
 supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+_supabase_init_attempted = False
 
-if not supabase:
-    raise RuntimeError(
-        "[AI-SELECTOR ERROR] Supabase client failed to initialise. "
-        "Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in environment variables."
-    )
+def _get_supabase_client() -> Optional[Client]:
+    """Lazy Supabase initialization that never raises exceptions."""
+    global supabase, _supabase_init_attempted
+    
+    if _supabase_init_attempted:
+        return supabase
+    
+    _supabase_init_attempted = True
+    
+    try:
+        load_dotenv()  # Safe to call multiple times
+        
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        
+        if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+            supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+            return supabase
+        else:
+            return None
+    except Exception:
+        return None
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -907,13 +921,15 @@ def save_ai_tickers(user_id: str, mode: str, tickers):
 
     This function normalises both formats to the unified schema.
     """
-    if not supabase:
+    supabase_client = _get_supabase_client()
+    
+    if not supabase_client:
         print("[AI-Tickers] Supabase client not configured — cannot save tickers.")
         return
 
     try:
         # Always clear old results for this user/mode
-        supabase.table("ai_tickers").delete().match({
+        supabase_client.table("ai_tickers").delete().match({
             "user_id": user_id,
             "mode": mode,
         }).execute()
@@ -959,7 +975,7 @@ def save_ai_tickers(user_id: str, mode: str, tickers):
         return
 
     try:
-        supabase.table("ai_tickers").insert(payload).execute()
+        supabase_client.table("ai_tickers").insert(payload).execute()
         print(f"[AI-Tickers] Saved {len(payload)} ticker rows for user_id={user_id} mode={mode}")
     except Exception as e:
         print(f"[AI-Tickers] Failed to save tickers for user_id={user_id} mode={mode}: {e!r}")
@@ -973,13 +989,14 @@ def fetch_ai_tickers(user_id: str, mode: str):
     Returns a list of ticker symbols ordered by rank:
       ["AAPL", "TSLA", ...]
     """
-    if not supabase:
+    supabase_client = _get_supabase_client()
+    if not supabase_client:
         print("[AI-Tickers] Supabase not configured — cannot fetch tickers.")
         return []
 
     try:
         resp = (
-            supabase.table("ai_tickers")
+            supabase_client.table("ai_tickers")
             .select("ticker, rank")
             .eq("user_id", user_id)
             .eq("mode", mode)
@@ -1035,9 +1052,10 @@ def get_top_tickers(limit: int, user_id: str, mode: str):
     """
     global _last_selection_time, _last_good_cache, _forced_prune_symbols
     
-    if not supabase:
-        logging.warning("[AI-Tickers] Supabase client not configured — returning empty ticker list.")
-        return []
+    supabase_client = _get_supabase_client()
+    if not supabase_client:
+        logging.warning("AI selector: Supabase not configured, using fallback tickers")
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
     
     now = time.time()
     cache_key = f"{user_id}:{mode}"

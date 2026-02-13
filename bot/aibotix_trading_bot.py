@@ -295,13 +295,6 @@ def reason_log(key: str, message: str, min_seconds: int = 120) -> None:
     _last_reason_log[key] = now
     supabase_log(message)
 
-def ui_log(key: str, message: str, min_seconds: int = 60) -> None:
-    """Rate-limited user-friendly log message."""
-    try:
-        reason_log(key, message, min_seconds)
-    except Exception as e:
-        logging.error(f"UI log failed: {e}")
-
 # Section 5: Data degraded position management
 async def handle_degraded_positions(degraded_stats: dict) -> None:
     """
@@ -1429,17 +1422,30 @@ def get_latest_quote(symbol):
         return (None, None, None, None)
 
 def spread_is_acceptable(spread_pct: float | None, atr_pct: float | None) -> bool:
-    """Adaptive spread gate: requires spread <= absolute cap AND <= fraction of ATR%."""
+    """Adaptive spread gate: mode-aware with spread-vs-ATR sanity check."""
     try:
         if spread_pct is None:
             return True  # if we can't compute spread, don't block; other gates still apply
         if spread_pct <= 0:
             return True
-        if spread_pct > MAX_SPREAD_PCT:
-            return False
+        
+        # Mode-aware spread limits
+        paper_mode = SESSION.CURRENT_MODE == "paper"
+        spread_limit = SPREAD_MAX_PCT_PAPER if paper_mode else SPREAD_MAX_PCT_LIVE
+        
+        # Must pass both conditions to block
+        exceeds_limit = spread_pct > spread_limit
+        exceeds_atr_ratio = False
+        
+        if atr_pct is not None and atr_pct > 0:
+            exceeds_atr_ratio = (spread_pct / atr_pct) > SPREAD_ATR_RATIO_MAX
+        
+        # Block only if both conditions are true (or atr_pct unavailable, fall back to limit only)
         if atr_pct is None or atr_pct <= 0:
-            return spread_pct <= MAX_SPREAD_PCT
-        return spread_pct <= (MAX_SPREAD_ATR_FRACTION * atr_pct)
+            return not exceeds_limit
+        else:
+            return not (exceeds_limit and exceeds_atr_ratio)
+            
     except Exception:
         return True
 
@@ -1771,7 +1777,6 @@ def fetch_data(symbol):
         return df
     except Exception as e:
         logging.error(f"{symbol}: Data/indicator failure - {e}")
-        return None
         mark_exec_bad_ticker(symbol, "indicator_exception")
         return None
 
@@ -1813,11 +1818,28 @@ TIER2_SIZE_MULT = 0.50        # half-size entries
 MIN_ATR_PCT = 0.0006   # allow calmer names (0.06%)
 MAX_ATR_PCT = 0.12     # slightly wider top-end; extreme names still filtered elsewhere
 
+# Mode-aware ATR limits (relax circuit exits in live)
+ATR_MIN_PCT_PAPER = 0.0008     # 0.08% for paper
+ATR_MIN_PCT_LIVE = 0.0005      # 0.05% for live (more relaxed)
+ATR_MAX_PCT_PAPER = 0.0250     # 2.50% for paper
+ATR_MAX_PCT_LIVE = 0.0400      # 4.00% for live (wider for normal volatility)
+
+# Dead market / squeeze thresholds (tighter definition)
+DEAD_ATR_PCT_PAPER = 0.0010    # 0.10% ATR threshold for paper
+DEAD_ATR_PCT_LIVE = 0.0007     # 0.07% ATR threshold for live
+DEAD_RANGE_PCT_PAPER = 0.0020  # 0.20% range compression for paper
+DEAD_RANGE_PCT_LIVE = 0.0015   # 0.15% range compression for live
+
 # Spread filtering (relaxed + adaptive)
 # Many tickers (especially outside mega-caps) have spreads >0.15% even when tradable.
 # We cap spread by BOTH an absolute % and a fraction of ATR% so we don't enter illiquid names.
 MAX_SPREAD_PCT = 0.0040            # 0.40% absolute cap
 MAX_SPREAD_ATR_FRACTION = 0.45     # allow spread up to 45% of ATR% (still adaptive)
+
+# Mode-aware spread limits (prevent blocking liquid names in live IEX)
+SPREAD_MAX_PCT_PAPER = 0.0010      # 0.10% for paper
+SPREAD_MAX_PCT_LIVE = 0.0025       # 0.25% for live (higher due to IEX)
+SPREAD_ATR_RATIO_MAX = 0.80        # spread must not exceed 80% of atr_pct
 
 # Entry quality guardrails
 MAX_RSI_FOR_ENTRY = 65        # avoid chasing overbought moves on entry
@@ -2013,6 +2035,58 @@ async def wait_until_market_open_or_preopen(preopen_minutes: int = 10):
     await asyncio.sleep(max(seconds_to_open, 1))
     return "open"
 
+def should_force_flatten_now(trading_client):
+    """Check if we should force flatten all positions (within 5 minutes of market close)."""
+    try:
+        clock = trading_client.get_clock()
+        if not clock.is_open:
+            return False
+        
+        # Use timezone-aware datetime from clock
+        current_time = clock.timestamp
+        next_close = clock.next_close
+        
+        # Calculate time to close in minutes
+        time_to_close = (next_close - current_time).total_seconds() / 60.0
+        
+        return time_to_close <= 5.0
+    except Exception as e:
+        logging.warning(f"Failed to check flatten time: {e}")
+        return False
+
+def force_flatten_all_positions(trading_client, supabase_log):
+    """Force close all open positions regardless of filters."""
+    try:
+        supabase_log("eod_flatten_start")
+        positions = trading_client.get_all_positions()
+        
+        for position in positions:
+            try:
+                symbol = position.symbol
+                qty = abs(float(position.qty))
+                side = OrderSide.SELL if float(position.qty) > 0 else OrderSide.BUY
+                
+                # Submit market close order
+                close_order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(close_order)
+                
+                supabase_log(f"eod_flatten_close | {symbol} | qty={qty}")
+                logging.info(f"EOD flatten: closed {symbol} qty={qty}")
+                
+            except Exception as e:
+                logging.error(f"Failed to close position {position.symbol}: {e}")
+        
+        supabase_log("eod_flatten_done")
+        logging.info("EOD flatten completed")
+        
+    except Exception as e:
+        logging.error(f"Failed to flatten positions: {e}")
+
 async def trade_loop_async(allowed_tickers=None):
     # Ensure correct session context
     get_session(SESSION.USER_ID, SESSION.CURRENT_MODE)
@@ -2154,6 +2228,13 @@ async def trade_loop_async(allowed_tickers=None):
             elif risk_state == "DEGRADED":
                 logging.warning("Trading in DEGRADED state - reduced position sizes and stricter entry criteria")
                 # Continue trading with degraded conditions
+
+            # EOD Hard Flatten Check (bypasses all filters)
+            if should_force_flatten_now(SESSION.api):
+                force_flatten_all_positions(SESSION.api, supabase_log)
+                # Skip rest of evaluation cycle - no new entries near close
+                await asyncio.sleep(60)
+                continue
 
             # 2. Throttled P&L update (max once per 60 seconds)
             if (SESSION.last_pnl_update is None or 
@@ -2411,11 +2492,15 @@ async def process_ticker(ticker):
             return
 
         # Quick volatility guard
-        if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+        paper_mode = SESSION.CURRENT_MODE == "paper"
+        atr_min = ATR_MIN_PCT_PAPER if paper_mode else ATR_MIN_PCT_LIVE
+        atr_max = ATR_MAX_PCT_PAPER if paper_mode else ATR_MAX_PCT_LIVE
+        
+        if pd.isna(atr_pct) or atr_pct < atr_min or atr_pct > atr_max:
             supabase_log(f"blocked_atr_bounds | {ticker}")
             reason_log(
                 f"atr_skip:{ticker}",
-                f"entry_blocked | {ticker} | reason=atr_out_of_range | score={score} rsi={rsi} atr_pct={atr_pct}",
+                f"entry_blocked | {ticker} | reason=atr_out_of_range | score={score} rsi={rsi} atr_pct={atr_pct} atr_min={atr_min:.4f} atr_max={atr_max:.4f}",
                 min_seconds=300,
             )
             return
@@ -2429,14 +2514,17 @@ async def process_ticker(ticker):
             elif spread_pct > (MAX_SPREAD_ATR_FRACTION * atr_pct):
                 spread_size_mult = 0.60
         
-        # FIX 4: Explicit trade block reason logging
+        # FIX 4: Explicit trade block reason logging  
         # Keep existing logging for wide spreads (but don't block the trade)
         if not spread_is_acceptable(spread_pct, atr_pct) and not have_position:
             # Spread is handled via size reduction, not hard veto
             supabase_log(f"blocked_spread | {ticker}")
+            paper_mode = SESSION.CURRENT_MODE == "paper"
+            spread_limit = SPREAD_MAX_PCT_PAPER if paper_mode else SPREAD_MAX_PCT_LIVE
+            spread_atr_ratio = (spread_pct / atr_pct) if (atr_pct and atr_pct > 0) else 0.0
             reason_log(
                 f"spread_soft:{ticker}",
-                f"spread_softened | {ticker} | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct}",
+                f"spread_softened | {ticker} | score={score} rsi={rsi} atr_pct={atr_pct} spread_pct={spread_pct} spread_limit={spread_limit:.4f} spread_atr_ratio={spread_atr_ratio:.2f}",
                 min_seconds=300,
             )
 
@@ -2466,12 +2554,28 @@ async def process_ticker(ticker):
         # Phase 1 Safety: SQUEEZE handling (soft sizing)
         # Instead of a hard ban (which can cause zero trades for long periods), we:
         # - Apply size reduction for SQUEEZE regimes
-        # - Only hard block ultra-low volatility (extreme dead market)
+        # - Only hard block when BOTH volatility AND range are extremely compressed
         squeeze_size_mult = 1.0
         if regime == "SQUEEZE" and not have_position:
-            if pd.isna(atr_pct) or atr_pct < 0.0009:
+            # Calculate range compression using recent bars
+            paper_mode = SESSION.CURRENT_MODE == "paper"
+            dead_atr_threshold = DEAD_ATR_PCT_PAPER if paper_mode else DEAD_ATR_PCT_LIVE
+            dead_range_threshold = DEAD_RANGE_PCT_PAPER if paper_mode else DEAD_RANGE_PCT_LIVE
+            
+            # Get recent high/low for range calculation (use last 5 bars if available)
+            if len(df) >= 5:
+                recent_high = df['high'].iloc[-5:].max()
+                recent_low = df['low'].iloc[-5:].min()
+            else:
+                recent_high = df['high'].iloc[-1]
+                recent_low = df['low'].iloc[-1]
+            
+            range_pct = (recent_high - recent_low) / close_price if close_price > 0 else 0.0
+            
+            # Block only if BOTH ATR and range are extremely compressed
+            if (pd.isna(atr_pct) or atr_pct < dead_atr_threshold) and (range_pct < dead_range_threshold):
                 logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=SQUEEZE_DEAD_MARKET atr%={atr_pct:.4f}")
-                reason_log(f"squeeze_dead:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_dead_market | score={score} rsi={rsi} atr_pct={atr_pct}")
+                reason_log(f"squeeze_dead:{ticker}", f"entry_blocked | {ticker} | reason=squeeze_dead_market | score={score} rsi={rsi} atr_pct={atr_pct} range_pct={range_pct:.4f} dead_atr_threshold={dead_atr_threshold:.4f} dead_range_threshold={dead_range_threshold:.4f}")
                 return
             else:
                 squeeze_size_mult = 0.35  # Reduced size for SQUEEZE regime
@@ -2785,9 +2889,13 @@ async def process_ticker(ticker):
                 return
 
         # 2. ATR volatility filter (avoid weak or explosive regimes)
-        if pd.isna(atr_pct) or atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+        paper_mode = SESSION.CURRENT_MODE == "paper"
+        atr_min = ATR_MIN_PCT_PAPER if paper_mode else ATR_MIN_PCT_LIVE
+        atr_max = ATR_MAX_PCT_PAPER if paper_mode else ATR_MAX_PCT_LIVE
+        
+        if pd.isna(atr_pct) or atr_pct < atr_min or atr_pct > atr_max:
             supabase_log(f"blocked_atr_bounds | {ticker}")
-            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=ATR_RANGE atr_pct={atr_pct:.4f}")
+            logging.debug(f"[ENTRY BLOCKED] {ticker} | reason=ATR_RANGE atr_pct={atr_pct:.4f} atr_min={atr_min:.4f} atr_max={atr_max:.4f}")
             return
 
         # 3. MACD confirmation (soft)
